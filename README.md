@@ -10,3 +10,11 @@ Speculation #2: The branch of the ontology that they are mapping to will tell us
 
 Speculation #3: given #1 and #2, it should be possible to heuristially detect when a column belongs in a specific CARE-SM data model, extract only the columns necessary for that model, execute the transformations, and write-out a valid CARE-SM template.  Repeat for every mappable column.
 
+## How it turned out
+
+All three speculations survived testing, but none survived unmodified.
+
+**See [PIPELINE.md](PIPELINE.md)** for the end-to-end design: workflow diagram, the
+column-routing decision tree, the resources we assemble, stage-by-stage detail, and the
+validation measurements.
+

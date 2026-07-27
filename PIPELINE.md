@@ -6,8 +6,15 @@ every step, which decision was made and how confident we are in it.
 This document is the "how it actually works" companion to [README.md](README.md),
 which records the original speculations. Diagrams render directly on GitHub.
 
-**Status:** 7 CARE-SM models generating end-to-end · validated on 2 datasets (90 patients)
-· 1 open model-design decision.
+**Status:** 7 CARE-SM (v2) models generating end-to-end · validated on 2 datasets
+(90 patients) · negative observations now captured.
+
+> **Update — CARE-SM v2 & negation (2026-07).** The transformer now targets
+> **CARE-SM v2**. The ontology code lives in `target` (Phenotype/Diagnosis/
+> Symptoms_onset) or `attribute_type` (Sex/Status), and `value` is a typed
+> literal. Crucially, the "negatives withheld" limitation in §7 is **resolved**:
+> a confirmed-absent finding is now a first-class `value=false` row. Output was
+> verified through the actual v2 Toolkit (see §6).
 
 ---
 
@@ -212,7 +219,7 @@ Seven CARE-SM models generate end-to-end from both datasets. Row counts are
 
 | Model | Rows | Mapping route | Notable decision |
 |---|---:|---|---|
-| Phenotype | 40 / 18 | semantic search + boolean flags | negatives withheld, not asserted |
+| Phenotype | 68 / 120 | semantic search + boolean flags | negatives captured as `value=false` (v2) |
 | Diagnosis | 28 / 60 | free text → MONDO; CURIE → ORDO | pre-coded values bypass search |
 | Sex | 30 / 60 | curated lookup | prefers "sex at birth" column |
 | Birthdate | 30 / 60 | deterministic | — |
@@ -255,12 +262,16 @@ answer.**
 
 ## 7. What is not solved
 
-**The negation question.** The Phenotype model asserts presence only — there is
-structurally no way to record "cardiomyopathy: confirmed absent". Negatives are
-currently withheld, which is safe but lossy. Structurally, a Yes/No clinical flag
-behaves like an *observation with a value*, which is how other CARE-SM models already
-work. This is a genuine model-design decision, not a coding problem, and is under
-discussion.
+**The negation question — RESOLVED (CARE-SM v2).** Previously the Phenotype model
+asserted presence only, so "cardiomyopathy: confirmed absent" was unrecordable and
+negatives were withheld. CARE-SM v2 added exactly the structure this document predicted
+was the right fit — a Yes/No flag as an *observation with a value*: the tested code goes
+in `target` and the boolean result in `value`, and the Toolkit builds the Attribute node
+only when `value=true`. The transformer now emits negatives as `value=false` instead of
+dropping them. Impact: Phenotype rows went from 40→68 (synthetic) and **18→120 (partner)**
+— we had been discarding 102 confirmed-absent Cardiomyopathy/Arrhythmia findings. Verified
+through the actual v2 Toolkit: of 120 partner Phenotype rows, 18 `true` all carry an
+Attribute and 102 `false` carry none.
 
 **A missing fourth route.** High-cardinality controlled vocabularies — gene symbols,
 units, drug codes — are neither free text nor small enumerations. They need an

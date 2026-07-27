@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-build_care_template.py — emit a CARE-SM per-type template CSV from a raw dump.
+build_care_template.py — emit a CARE-SM (v2) per-type template CSV from a dump.
 
-The transform is not a column projection: it explodes multi-value cells into
-rows, sources start/end dates from a different column than the value, and maps
-every cell (not a sample) to an ontology IRI.
+Targets CARE-SM v2 (repo CARE-Semantic-Model-Version-2, w3id CARE-SM-2). The
+column contract is the one the v2 Toolkit ENFORCES: it rejects any column
+outside its allowed set, so each model emits exactly the columns its v2 example
+CSV uses. Notably v2 differs from v1:
 
-STRUCTURE IS DRIVEN BY THE AUTHORITATIVE M/O/U SPEC (from the CARE-SM CSV
-glossary, https://care-sm.readthedocs.io/en/latest/glossary.html), NOT by the
-example CSVs (which are known to be incorrect). For each model, every field is
-Mandatory (M), Optional (O) or Unused (U):
-  * a model's CSV header = its M and O fields, in canonical order; U fields are
-    NEVER emitted;
-  * `value` (O in most models) = the human-readable label of `valueIRI`;
-  * `value_datatype` is per-model (Unused for Sex/Phenotype/Diagnosis, Mandatory
-    for Symptoms_onset/Medication/…);
-  * `event_id` (O) groups elements from one clinical visit for the quad context
-    URI. We have no visit-grouping information, so the column is present but left
-    BLANK — never fabricated.
+  * the ontology code being tested lives in `target` (Phenotype, Diagnosis,
+    Symptoms_onset) or in `attribute_type` (Sex, Status) — NOT `valueIRI`;
+  * `value` is a typed literal routed by `value_datatype`
+    (xsd:boolean / xsd:date / …);
+  * there is no `specification` / `valueIRI` column.
 
-Negation: the Phenotype template has no negation slot, so negatives ("denies
-dysphagia" / flag = No) are skipped and counted pending a CARE-SM model decision
-(lab meeting scheduled).
+NEGATION (new in v2, for Phenotype and Diagnosis): a record supplies `target`
+(what was tested) plus `value` = true/false. A false result is a first-class,
+queryable row — the Toolkit builds the Attribute node only when value == true.
+So negatives ("denies dysphagia", flag = No) are now EMITTED as value=false
+rather than dropped.
+
+`event_id` stays blank: it groups same-visit observations for the quad context
+URI, and the source dumps don't carry visit grouping.
 
 Usage:
   python3 build_care_template.py mockdata/dump.mock -o out_dir/ --model Phenotype
@@ -37,62 +36,48 @@ from types import SimpleNamespace
 
 import profile_columns as pc
 
-# ---- authoritative field spec ------------------------------------------------
-# Canonical field order for the per-type CSV template.
-CANONICAL_ORDER = [
-    "model", "pid", "value", "value_datatype", "valueIRI", "activity", "unit",
-    "input", "target", "specification", "frequency_type", "frequency_value",
-    "agent", "startdate", "enddate", "age", "comments", "event_id",
-    "organisation", "duration_value", "duration_startdate", "duration_enddate",
-]
-
-# Per model: which fields are Mandatory and Optional (everything else Unused).
-# Source: CARE-SM CSV glossary (M/O/N markers), verified against the rendered page.
-MODEL_SPEC = {
-    "Birthdate":      {"M": ["model", "pid", "value"], "O": ["specification", "startdate", "enddate", "comments", "event_id"]},
-    "Birthyear":      {"M": ["model", "pid", "value"], "O": ["specification", "comments", "event_id"]},
-    "Birthplace":     {"M": ["model", "pid", "valueIRI"], "O": ["value", "specification", "startdate", "enddate", "comments", "event_id"]},
-    "Deathdate":      {"M": ["model", "pid", "value"], "O": ["valueIRI", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "First_visit":    {"M": ["model", "pid"], "O": ["value", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Sex":            {"M": ["model", "pid", "valueIRI"], "O": ["value", "specification", "startdate", "enddate", "comments", "event_id"]},
-    "Status":         {"M": ["model", "pid", "valueIRI"], "O": ["value", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Symptoms_onset": {"M": ["model", "pid", "value", "value_datatype"], "O": ["target", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Phenotype":      {"M": ["model", "pid", "valueIRI"], "O": ["value", "target", "specification", "startdate", "enddate", "age", "comments", "event_id", "duration_value", "duration_startdate", "duration_enddate"]},
-    "Diagnosis":      {"M": ["model", "pid", "valueIRI"], "O": ["value", "target", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Examination":    {"M": ["model", "pid", "value", "valueIRI"], "O": ["value_datatype", "activity", "unit", "target", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Laboratory":     {"M": ["model", "pid", "value", "target"], "O": ["value_datatype", "activity", "unit", "input", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Medication":     {"M": ["model", "pid", "value", "value_datatype", "valueIRI", "unit", "agent"], "O": ["activity", "specification", "frequency_type", "frequency_value", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Genetic":        {"M": ["model", "pid", "value", "valueIRI"], "O": ["activity", "input", "specification", "agent", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Surgery":        {"M": ["model", "pid", "activity"], "O": ["target", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Biobank":        {"M": ["model", "pid", "value", "organisation"], "O": ["input", "specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Hospitalization": {"M": ["model", "pid", "activity"], "O": ["specification", "startdate", "enddate", "age", "comments", "event_id"]},
-    "Disability":     {"M": ["model", "pid", "value", "value_datatype", "specification"], "O": ["unit", "enddate", "age", "comments", "event_id", "duration_value", "duration_startdate", "duration_enddate"]},
+# ---- v2 Toolkit column contract ---------------------------------------------
+# The full set the v2 Toolkit accepts (toolkit/main.py `self.columns`). Any
+# column we emit MUST be in here or the Toolkit raises "Unexpected columns".
+TOOLKIT_COLUMNS = {
+    "model", "pid", "event_id", "value", "age", "value_datatype", "activity",
+    "unit", "input", "target", "protocol_id", "frequency_type",
+    "frequency_value", "startdate", "enddate", "comments", "organisation",
+    "duration_value", "duration_startdate", "duration_enddate",
+    "identifier_value", "input_value", "attribute_type", "output_type",
+    "output_id", "cause_id",
 }
 
-
-def model_header(model):
-    """CSV header for a model: its M and O fields in canonical order (U excluded)."""
-    spec = MODEL_SPEC[model]
-    allowed = set(spec["M"]) | set(spec["O"])
-    return [f for f in CANONICAL_ORDER if f in allowed]
+# Per-model column list = exactly the v2 example CSV header for that model.
+MODEL_COLUMNS = {
+    "Phenotype": ["model", "pid", "startdate", "enddate", "event_id", "target",
+                  "value", "value_datatype", "duration_value",
+                  "duration_startdate", "duration_enddate"],
+    "Diagnosis": ["model", "pid", "startdate", "enddate", "event_id", "target",
+                  "value", "value_datatype"],
+    "Sex": ["model", "pid", "startdate", "enddate", "event_id", "attribute_type"],
+    "Status": ["model", "pid", "value_datatype", "startdate", "enddate", "event_id", "attribute_type"],
+    "Birthdate": ["model", "pid", "value_datatype", "startdate", "enddate",
+                  "event_id", "value"],
+    "Deathdate": ["model", "pid", "value_datatype", "startdate", "enddate",
+                  "event_id", "value", "cause_id"],
+    "Symptoms_onset": ["model", "pid", "value_datatype", "startdate", "enddate",
+                       "event_id", "value", "target"],
+}
+# fail fast if a model list ever drifts outside the enforced set
+for _m, _cols in MODEL_COLUMNS.items():
+    _bad = set(_cols) - TOOLKIT_COLUMNS
+    assert not _bad, f"{_m} uses non-Toolkit columns {_bad}"
 
 
 def write_model_csv(model, rowdicts, path):
-    """Write rows (list of field->value dicts) using the model's M/O/U header.
-    Unset fields (incl. the deliberately-blank event_id) are empty. Returns a
-    Counter of any Mandatory fields left blank (should be zero)."""
-    header = model_header(model)
-    mandatory = MODEL_SPEC[model]["M"]
-    violations = Counter()
+    header = MODEL_COLUMNS[model]
     with open(path, "w", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(header)
         for rd in rowdicts:
-            for m in mandatory:
-                if not rd.get(m):
-                    violations[m] += 1
             w.writerow([rd.get(col, "") for col in header])
-    return header, violations
+    return header
 
 
 # ---- shared helpers ----------------------------------------------------------
@@ -118,9 +103,6 @@ def generic_date_col(results):
 
 
 def date_col_for_model(model, results, prefer_startswith=None):
-    """The date column feeding a given model. Prefers a DATE column whose guessed
-    model matches and (optionally) whose header starts with a keyword — so
-    'Diagnosis date' wins over 'Cardiomyopathy diagnosis date'."""
     cands = [r for r in results if r["lane"] == "DATE" and r.get("care_sm_model") == model]
     if prefer_startswith:
         for r in cands:
@@ -129,6 +111,15 @@ def date_col_for_model(model, results, prefer_startswith=None):
     if cands:
         return cands[0]["column"]
     return generic_date_col(results)
+
+
+def date_cols_for_model(model, results):
+    """(event_date_col, datestamp_col): event date lacks 'datestamp' in its
+    header; the record datestamp contains it."""
+    cols = [r["column"] for r in results if r["lane"] == "DATE" and r.get("care_sm_model") == model]
+    event = next((c for c in cols if "datestamp" not in c.lower()), None)
+    stamp = next((c for c in cols if "datestamp" in c.lower()), None)
+    return event, stamp
 
 
 def resolve_flag_date(flag_header, row, colidx, results, gdate):
@@ -144,6 +135,8 @@ def resolve_flag_date(flag_header, row, colidx, results, gdate):
 
 # ============================================================ Phenotype ======
 def build_phenotype(headers, body, results, searcher, args):
+    """v2: target = HPO code, value = true/false (xsd:boolean). Negatives —
+    free-text 'denies X' and boolean flag = No — are emitted as value=false."""
     colidx = {h: i for i, h in enumerate(headers)}
     pid_col = pick_pid(results)
     gdate = generic_date_col(results)
@@ -158,8 +151,12 @@ def build_phenotype(headers, body, results, searcher, args):
     def hpo(term):
         hit = searcher.top(term)
         if hit and "_error" not in hit and hit.get("prefix") == "hp" and hit.get("score", 0) >= args.score:
-            return hit["iri"], hit.get("label", "")
+            return hit["iri"]
         return None
+
+    def emit(pid, iri, value, date):
+        return {"model": "Phenotype", "pid": pid, "target": iri, "value": value,
+                "value_datatype": "xsd:boolean", "startdate": date, "enddate": date}
 
     rows = []
     for row in body:
@@ -172,31 +169,26 @@ def build_phenotype(headers, body, results, searcher, args):
                 continue
             date = row[colidx[gdate]].strip() if gdate else ""
             for part in split_parts(cell):
-                if NEG_RE.match(part):
-                    stats["negated_skipped"] += 1
-                    continue
-                m = hpo(part)
-                if not m:
+                negated = bool(NEG_RE.match(part))
+                term = NEG_RE.sub("", part, count=1).strip() if negated else part
+                iri = hpo(term)
+                if not iri:
                     stats["unmapped_skipped"] += 1
                     continue
-                iri, label = m
-                rows.append({"model": "Phenotype", "pid": pid, "valueIRI": iri,
-                             "value": label, "startdate": date, "enddate": date})
-                stats["emitted_freetext"] += 1
+                rows.append(emit(pid, iri, "false" if negated else "true", date))
+                stats["emitted_negative" if negated else "emitted_positive"] += 1
         for r in flags:
             cell = row[colidx[r["column"]]].strip().lower()
-            if cell in AFFIRMATIVE:
-                maps = r.get("proposed_mappings") or []
-                if not maps:
-                    stats["flag_no_map"] += 1
-                    continue
-                iri, label = maps[0].get("iri"), maps[0].get("label", "")
-                date = resolve_flag_date(r["column"], row, colidx, results, gdate)
-                rows.append({"model": "Phenotype", "pid": pid, "valueIRI": iri,
-                             "value": label, "startdate": date, "enddate": date})
-                stats["emitted_flags"] += 1
-            elif cell in NEGATIVE:
-                stats["flag_negative_skipped"] += 1
+            polarity = "true" if cell in AFFIRMATIVE else "false" if cell in NEGATIVE else None
+            if polarity is None:
+                continue
+            maps = r.get("proposed_mappings") or []
+            if not maps:
+                stats["flag_no_map"] += 1
+                continue
+            date = resolve_flag_date(r["column"], row, colidx, results, gdate)
+            rows.append(emit(pid, maps[0].get("iri"), polarity, date))
+            stats["emitted_flag_positive" if polarity == "true" else "emitted_flag_negative"] += 1
     return rows, stats
 
 
@@ -219,6 +211,11 @@ def expand_curie(value):
 
 
 def build_diagnosis(headers, body, results, searcher, args):
+    """v2: target = disease code, value = true/false (xsd:boolean). CURIE cols
+    expand deterministically; free-text cols resolve to MONDO via search. Our
+    data carries only affirmed diagnoses, so value is 'true' here — but the
+    false path is structurally identical if a source ever records a ruled-out
+    diagnosis."""
     colidx = {h: i for i, h in enumerate(headers)}
     pid_col = pick_pid(results)
     ddate = date_col_for_model("Diagnosis", results, prefer_startswith="diagnos")
@@ -233,8 +230,12 @@ def build_diagnosis(headers, body, results, searcher, args):
     def mondo(term):
         hit = searcher.top(term)
         if hit and "_error" not in hit and hit.get("prefix") == "mondo" and hit.get("score", 0) >= args.score:
-            return hit["iri"], hit.get("label", "")
+            return hit["iri"]
         return None
+
+    def emit(pid, iri, date):
+        return {"model": "Diagnosis", "pid": pid, "target": iri, "value": "true",
+                "value_datatype": "xsd:boolean", "startdate": date, "enddate": date}
 
     rows = []
     for row in body:
@@ -250,34 +251,37 @@ def build_diagnosis(headers, body, results, searcher, args):
             if not iri:
                 stats["curie_unexpanded"] += 1
                 continue
-            # value (label) left blank for pre-coded CURIEs — no label fetched.
-            rows.append({"model": "Diagnosis", "pid": pid, "valueIRI": iri,
-                         "startdate": date, "enddate": date})
+            rows.append(emit(pid, iri, date))
             stats["emitted_curie"] += 1
         for r in freetext_cols:
             v = row[colidx[r["column"]]].strip()
             if not v:
                 continue
             for part in split_parts(v):
-                m = mondo(part)
-                if not m:
+                iri = mondo(part)
+                if not iri:
                     stats["unmapped_skipped"] += 1
                     continue
-                iri, label = m
-                rows.append({"model": "Diagnosis", "pid": pid, "valueIRI": iri,
-                             "value": label, "startdate": date, "enddate": date})
+                rows.append(emit(pid, iri, date))
                 stats["emitted_freetext"] += 1
     return rows, stats
 
 
-# ============================================================ Sex =============
-# Curated lookup (NMDO search returns nonsense for "Male"). NCIT codes per CARE-SM.
+# ============================================================ Sex / Status ===
+# v2: the categorical concept goes in `attribute_type` (was v1 valueIRI).
 SEX_MAP = {
-    "male": ("http://purl.obolibrary.org/obo/NCIT_C20197", "male"),
-    "m": ("http://purl.obolibrary.org/obo/NCIT_C20197", "male"),
-    "female": ("http://purl.obolibrary.org/obo/NCIT_C16576", "female"),
-    "f": ("http://purl.obolibrary.org/obo/NCIT_C16576", "female"),
+    "male": "http://purl.obolibrary.org/obo/NCIT_C20197",
+    "m": "http://purl.obolibrary.org/obo/NCIT_C20197",
+    "female": "http://purl.obolibrary.org/obo/NCIT_C16576",
+    "f": "http://purl.obolibrary.org/obo/NCIT_C16576",
 }
+SIO_ALIVE = "http://semanticscience.org/resource/SIO_010058"  # "alive"
+SIO_DEAD = "http://semanticscience.org/resource/SIO_010059"    # "dead"
+STATUS_MAP = {
+    "yes": SIO_ALIVE, "alive": SIO_ALIVE, "living": SIO_ALIVE,
+    "no": SIO_DEAD, "dead": SIO_DEAD, "deceased": SIO_DEAD,
+}
+STATUS_HEADER_RE = re.compile(r"\b(alive|vital\s*status|life\s*status)\b", re.I)
 
 
 def build_sex(headers, body, results, searcher, args):
@@ -298,33 +302,53 @@ def build_sex(headers, body, results, searcher, args):
             pid = row[colidx[pid_col]].strip() if pid_col else ""
             if not pid or pid in seen:
                 continue
-            mapped = SEX_MAP.get(row[colidx[sex_col]].strip().lower())
-            if not mapped:
+            iri = SEX_MAP.get(row[colidx[sex_col]].strip().lower())
+            if not iri:
                 stats["unmapped_skipped"] += 1
                 continue
-            iri, label = mapped
             date = row[colidx[bdate]].strip() if bdate else ""
-            rows.append({"model": "Sex", "pid": pid, "valueIRI": iri, "value": label,
+            rows.append({"model": "Sex", "pid": pid, "attribute_type": iri,
                          "startdate": date, "enddate": date})
             seen.add(pid)
             stats["emitted"] += 1
     return rows, stats
 
 
+def build_status(headers, body, results, searcher, args):
+    colidx = {h: i for i, h in enumerate(headers)}
+    pid_col = pick_pid(results)
+    status_col = next((r["column"] for r in results
+                       if r["lane"] in ("BOOLEAN", "DICTIONARY") and STATUS_HEADER_RE.search(r["column"])), None)
+    sdate = None
+    if status_col:
+        pref = status_col.lower()
+        sdate = next((r["column"] for r in results
+                      if r["lane"] == "DATE" and r["column"].lower().startswith(pref)), None)
+    stats = Counter()
+    stats["_pid"] = pid_col
+    stats["_status"] = status_col or "(none)"
+    stats["_date"] = sdate or "(none)"
+    rows = []
+    if status_col:
+        for row in body:
+            pid = row[colidx[pid_col]].strip() if pid_col else ""
+            if not pid:
+                continue
+            iri = STATUS_MAP.get(row[colidx[status_col]].strip().lower())
+            if not iri:
+                stats["unmapped_skipped"] += 1
+                continue
+            d = row[colidx[sdate]].strip() if sdate else ""
+            rows.append({"model": "Status", "pid": pid, "value_datatype": "xsd:string",
+                         "attribute_type": iri, "startdate": d, "enddate": d})
+            stats["emitted"] += 1
+    return rows, stats
+
+
 # ============================================================ date models ====
-def date_cols_for_model(model, results):
-    """Return (event_date_col, datestamp_col) for a model: the event date is a
-    DATE column of that model whose header lacks 'datestamp'; the datestamp (the
-    record/registration date) is one whose header contains 'datestamp'."""
-    cols = [r["column"] for r in results if r["lane"] == "DATE" and r.get("care_sm_model") == model]
-    event = next((c for c in cols if "datestamp" not in c.lower()), None)
-    stamp = next((c for c in cols if "datestamp" in c.lower()), None)
-    return event, stamp
-
-
 def _simple_date_model(model, headers, body, results):
-    """Birthdate / Deathdate: value = the date; startdate=enddate = the date
-    (per the CARE-SM RDF examples). Skips patients with no date."""
+    """Birthdate / Deathdate: value = the date (xsd:date); startdate=enddate =
+    the date. Skips patients with no date."""
     colidx = {h: i for i, h in enumerate(headers)}
     pid_col = pick_pid(results)
     event, _ = date_cols_for_model(model, results)
@@ -340,7 +364,8 @@ def _simple_date_model(model, headers, body, results):
         if not d:
             stats["blank_skipped"] += 1
             continue
-        rows.append({"model": model, "pid": pid, "value": d, "startdate": d, "enddate": d})
+        rows.append({"model": model, "pid": pid, "value": d,
+                     "value_datatype": "xsd:date", "startdate": d, "enddate": d})
         stats["emitted"] += 1
     return rows, stats
 
@@ -354,10 +379,9 @@ def build_deathdate(headers, body, results, searcher, args):
 
 
 def build_symptoms_onset(headers, body, results, searcher, args):
-    """value = onset date (value_datatype xsd:date, Mandatory here); startdate/
-    enddate = the record datestamp if present (else the onset date). `target`
-    (the specific symptom HPO) is left blank — the dumps carry disease-level
-    onset, not a per-symptom onset."""
+    """value = onset date (xsd:date); startdate/enddate = record datestamp if
+    present, else the onset date. `target` (specific symptom HPO) left blank —
+    the dumps carry disease-level onset, not per-symptom onset."""
     colidx = {h: i for i, h in enumerate(headers)}
     pid_col = pick_pid(results)
     event, stamp = date_cols_for_model("Symptoms_onset", results)
@@ -382,59 +406,15 @@ def build_symptoms_onset(headers, body, results, searcher, args):
     return rows, stats
 
 
-# ============================================================ Status =========
-SIO_ALIVE = "http://semanticscience.org/resource/SIO_010058"  # "alive"
-SIO_DEAD = "http://semanticscience.org/resource/SIO_010059"    # "dead"
-STATUS_MAP = {
-    "yes": (SIO_ALIVE, "alive"), "alive": (SIO_ALIVE, "alive"), "living": (SIO_ALIVE, "alive"),
-    "no": (SIO_DEAD, "dead"), "dead": (SIO_DEAD, "dead"), "deceased": (SIO_DEAD, "dead"),
-}
-STATUS_HEADER_RE = re.compile(r"\b(alive|vital\s*status|life\s*status)\b", re.I)
-
-
-def build_status(headers, body, results, searcher, args):
-    """Participation/vital status from an 'Alive' (Yes/No) column -> SIO
-    alive/dead. Dated by the matching '<col> datestamp'."""
-    colidx = {h: i for i, h in enumerate(headers)}
-    pid_col = pick_pid(results)
-    status_col = next((r["column"] for r in results
-                       if r["lane"] in ("BOOLEAN", "DICTIONARY") and STATUS_HEADER_RE.search(r["column"])), None)
-    sdate = None
-    if status_col:
-        pref = status_col.lower()
-        sdate = next((r["column"] for r in results
-                      if r["lane"] == "DATE" and r["column"].lower().startswith(pref)), None)
-    stats = Counter()
-    stats["_pid"] = pid_col
-    stats["_status"] = status_col or "(none)"
-    stats["_date"] = sdate or "(none)"
-    rows = []
-    if status_col:
-        for row in body:
-            pid = row[colidx[pid_col]].strip() if pid_col else ""
-            if not pid:
-                continue
-            mapped = STATUS_MAP.get(row[colidx[status_col]].strip().lower())
-            if not mapped:
-                stats["unmapped_skipped"] += 1
-                continue
-            iri, label = mapped
-            d = row[colidx[sdate]].strip() if sdate else ""
-            rows.append({"model": "Status", "pid": pid, "valueIRI": iri, "value": label,
-                         "startdate": d, "enddate": d})
-            stats["emitted"] += 1
-    return rows, stats
-
-
 BUILDERS = {
     "Phenotype": build_phenotype, "Diagnosis": build_diagnosis, "Sex": build_sex,
-    "Birthdate": build_birthdate, "Deathdate": build_deathdate,
-    "Symptoms_onset": build_symptoms_onset, "Status": build_status,
+    "Status": build_status, "Birthdate": build_birthdate,
+    "Deathdate": build_deathdate, "Symptoms_onset": build_symptoms_onset,
 }
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Emit a CARE-SM per-type template from a raw dump.")
+    ap = argparse.ArgumentParser(description="Emit a CARE-SM v2 per-type template from a raw dump.")
     ap.add_argument("file")
     ap.add_argument("-o", "--out", required=True, help="output directory")
     ap.add_argument("--model", default="Phenotype", choices=sorted(BUILDERS))
@@ -459,18 +439,16 @@ def main():
     rows, stats = BUILDERS[a.model](headers, body, results, searcher, args)
     os.makedirs(a.out, exist_ok=True)
     outpath = os.path.join(a.out, f"{a.model}.csv")
-    header, violations = write_model_csv(a.model, rows, outpath)
+    header = write_model_csv(a.model, rows, outpath)
 
     print(f"Wrote {len(rows)} {a.model} rows -> {outpath}")
-    print(f"  header ({len(header)} cols): {','.join(header)}")
+    print(f"  columns: {','.join(header)}")
     for k, v in stats.items():
         if k.startswith("_"):
             print(f"  {k[1:]+' source':16} {v}")
     for k, v in stats.items():
         if not k.startswith("_"):
             print(f"  {k:24} {v}")
-    if violations:
-        print(f"  !! Mandatory-field blanks: {dict(violations)}")
 
 
 if __name__ == "__main__":

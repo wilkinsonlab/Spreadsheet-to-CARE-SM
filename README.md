@@ -12,12 +12,15 @@ Speculation #3: given #1 and #2, it should be possible to heuristially detect wh
 
 ## How it turned out
 
-https://claude.ai/code/artifact/157d6ea2-f239-4fd2-ac98-5cc0fbe5d356
-
-
 All three speculations survived testing, but none survived unmodified.
 
 **See [PIPELINE.md](PIPELINE.md)** for the end-to-end design: workflow diagram, the
 column-routing decision tree, the resources we assemble, stage-by-stage detail, and the
 validation measurements.
+
+**See [talk/](talk/)** for the presentation deck (`spreadsheet-to-care-deck.pptx`) and its
+textual companion, [`talk/DECISION-WORKFLOW.md`](talk/DECISION-WORKFLOW.md) — every column-triage
+decision, in order, with the exact rule and whether/how the ontology search is involved.
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
 

@@ -36,6 +36,7 @@ import io
 import json
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -75,12 +76,84 @@ DATE_FORMATS = ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%Y"]
 
 # ============================================================ searchers ======
 class HttpSearcher:
-    """Calls the live nmdo-search endpoint; caches identical queries."""
+    """Calls the live nmdo-search endpoint; caches identical queries.
+
+    Also supports batch prewarming (see `prewarm`): a wide dataset (one
+    column per questionnaire item per visit) can need many thousands of
+    distinct queries, and at one request each that's a multi-hour job no
+    matter how much client-side concurrency is used — the bottleneck is
+    server-side (see nmdo-search's HANDOFF.md). Batching amortizes it.
+    """
+
+    # suffix on the single-query URL -> suffix for its batch counterpart
+    _BATCH_URL_SUFFIXES = {"/llm_search/search": "/llm_search/search_batch",
+                            "/search": "/search_batch"}
 
     def __init__(self, url, timeout=20):
         self.url = url
         self.timeout = timeout
-        self.cache = {}
+        self.cache = {}       # query -> top-1 hit (or {"_error": ...})
+        self.cache_k = {}     # query -> full top-k list
+        self._batch_url = self._derive_batch_url(url)
+        self._batch_supported = self._batch_url is not None
+
+    @classmethod
+    def _derive_batch_url(cls, url):
+        for suffix, batch_suffix in cls._BATCH_URL_SUFFIXES.items():
+            if url.endswith(suffix):
+                return url[: -len(suffix)] + batch_suffix
+        return None
+
+    def _fetch(self, query, k):
+        u = self.url + "?" + urllib.parse.urlencode({"q": query, "top_k": k})
+        with urllib.request.urlopen(u, timeout=self.timeout) as r:
+            return json.load(r).get("results", [])
+
+    def _fetch_batch(self, queries, k, timeout=None):
+        body = json.dumps({"queries": queries, "top_k": k}).encode("utf-8")
+        req = urllib.request.Request(
+            self._batch_url, data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+            return json.load(r)["results"]  # {query: [hit, hit, ...]}
+
+    def prewarm(self, queries, batch_size=256, quiet=False):
+        """Populate this searcher's caches for every query in `queries` up
+        front, via as few round trips as possible, so the real profiling/
+        template-emission pass that follows hits cache instead of the
+        network. Falls back to one-at-a-time `top()` calls — for this batch
+        only — the first time the batch endpoint errors (e.g. talking to a
+        search service that doesn't have it), so this is safe against any
+        nmdo-search-compatible deployment, not just an upgraded one."""
+        queries = sorted({q for q in queries if q and q.strip()} - self.cache.keys())
+        if not queries:
+            return
+        if not quiet:
+            print(f"Prewarming {len(queries)} unique queries "
+                  f"({'batched' if self._batch_supported else 'sequential — no batch endpoint'}) ...",
+                  file=sys.stderr)
+        t0 = time.time()
+        for i in range(0, len(queries), batch_size):
+            chunk = queries[i:i + batch_size]
+            if self._batch_supported:
+                try:
+                    results = self._fetch_batch(chunk, k=3, timeout=max(self.timeout, 60))
+                    for q, hit_list in results.items():
+                        self.cache[q] = hit_list[0] if hit_list else None
+                        self.cache_k[q] = hit_list[:3]
+                    continue
+                except Exception as e:
+                    self._batch_supported = False  # don't keep retrying a batch endpoint that isn't there
+                    if not quiet:
+                        print(f"  batch endpoint unavailable ({e}); "
+                              f"falling back to sequential for the rest of this run", file=sys.stderr)
+            for q in chunk:
+                self.top(q)
+            if not quiet:
+                print(f"\r  {min(i + batch_size, len(queries))}/{len(queries)}", end="", file=sys.stderr)
+                sys.stderr.flush()
+        if not quiet:
+            print(f"\nPrewarm done in {time.time() - t0:.1f}s", file=sys.stderr)
 
     def top(self, query):
         q = (query or "").strip()
@@ -88,15 +161,32 @@ class HttpSearcher:
             return None
         if q in self.cache:
             return self.cache[q]
-        u = self.url + "?" + urllib.parse.urlencode({"q": q, "top_k": 3})
         try:
-            with urllib.request.urlopen(u, timeout=self.timeout) as r:
-                results = json.load(r).get("results", [])
+            results = self._fetch(q, 3)
+            self.cache_k[q] = results
             hit = results[0] if results else None
         except Exception as e:  # network hiccup: degrade to "no hit", note once
             hit = {"_error": str(e)}
         self.cache[q] = hit
         return hit
+
+    def top_k(self, query, k=3):
+        """Full ranked candidate list (not just top-1) — used where a caller
+        wants to prefer an exact label/synonym match over the raw top score
+        (see pick_exact_match). Reuses top()'s cache when k<=3, since top()
+        already fetches top_k=3 from the server."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        if q in self.cache_k and k <= 3:
+            return self.cache_k[q][:k]
+        try:
+            results = self._fetch(q, k)
+        except Exception:
+            return []
+        if k <= 3:
+            self.cache_k[q] = results
+        return results
 
 
 class StubSearcher:
@@ -134,6 +224,69 @@ class StubSearcher:
             return None
         return {"score": round(min(best_s, 0.95), 3), "prefix": best[1],
                 "label": best[0], "iri": f"stub:{best[0]}", "_stub": True}
+
+    def top_k(self, query, k=3):
+        q = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+        if not q:
+            return []
+        scored = []
+        for label, (prefix, kws) in self.LEX.items():
+            overlap = len(q & kws)
+            if not overlap:
+                continue
+            score = overlap / (len(q | kws) ** 0.5)
+            scored.append({"score": round(min(score, 0.95), 3), "prefix": prefix,
+                            "label": label, "iri": f"stub:{label}", "_stub": True})
+        scored.sort(key=lambda h: -h["score"])
+        return scored[:k]
+
+
+# ==================================================== rerank / selection =====
+def _normalize_label(s):
+    """Lowercase, strip punctuation, collapse whitespace — for exact-match
+    comparison only (not for scoring)."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def pick_exact_match(query, candidates, score_threshold):
+    """Given the top-k candidates for `query`, prefer one whose label OR any
+    synonym is an exact (normalized) match to the query text, over the raw
+    top-scoring candidate — as long as that exact match still clears
+    score_threshold. This catches a real, measured failure mode: the
+    single highest-scoring neighbor is an imprecise/over-specified relative
+    of the true term (e.g. query "proximal muscle weakness" top-scores on
+    "Proximal upper limb muscle weakness" while an exact "Proximal muscle
+    weakness" sits at rank 2 or 3 — see the 2026-09 model benchmark).
+
+    Does NOT fix a different failure mode: a genuinely wrong/distractor
+    VALUE outscoring a real one across different query strings within a
+    column — that's profile_columns.py's hit-fraction guard's job, not
+    this function's (this only reranks among candidates for ONE query).
+
+    Returns (chosen_hit_or_None, reranked: bool) — `reranked` is True only
+    when the override actually changed which candidate was chosen, so
+    callers can log/count it rather than have it happen silently.
+    """
+    cands = [c for c in (candidates or [])
+             if c and "_error" not in c and c.get("score", 0) >= score_threshold]
+    if not cands:
+        return None, False
+    top = cands[0]
+    nq = _normalize_label(query)
+
+    def is_exact(c):
+        if _normalize_label(c.get("label")) == nq:
+            return True
+        return any(_normalize_label(s) == nq for s in (c.get("synonyms") or []))
+
+    if is_exact(top):
+        return top, False  # top score is already the exact match
+    for c in cands[1:]:
+        if is_exact(c):
+            return c, True
+    return top, False
 
 
 # ============================================================ loading ========
@@ -350,6 +503,96 @@ def classify(header, values, searcher, args, idx=0):
                proposed_mappings=maps)
 
 
+# ==================================================== query prewarming =======
+# What follows lets a caller discover, up front and for free (no network),
+# every literal string classify() will pass to a searcher — so an HttpSearcher
+# can prewarm them all via one batched round trip instead of one network call
+# per column. Deliberately recomputed from the column's own values rather than
+# read back off classify()'s returned report dict: that dict is a *display*
+# format (e.g. its "sample" field is only the first 5 raw values, for the
+# human-readable report), not a promise of exactly what got queried — reading
+# it as a query plan silently under-covers columns classify() will still hit
+# the network for at "real" run time. Recomputing directly from `vals` cannot
+# drift from classify()'s own logic that way.
+def literal_queries_for_column(header, vals, lane, args):
+    queries = set()
+    if lane in ("BOOLEAN", "NUMERIC"):
+        queries.add(clean_header_for_search(header))
+    elif lane == "DICTIONARY":
+        queries.update(sorted(set(vals))[: args.small_vocab])
+    elif lane == "SEARCH":
+        sample = list(dict.fromkeys(vals))[: args.sample]
+        for v in sample:
+            for part in re.split(r"\s*[;,]\s*|\s+and\s+", v):
+                part = part.strip()
+                if len(part) >= 3:
+                    queries.add(part)
+    return queries
+
+
+def ensure_pid_column(headers, body, results):
+    """If no column was recognized as a patient/record identifier (lane ==
+    'KEY'), synthesize one from row position and prepend it to headers/body/
+    results. Every CARE-SM builder requires a pid to emit a row at all (its
+    per-row loop does `if not pid: continue`), so a source file with no ID
+    column doesn't error — it silently emits ZERO rows for every model, which
+    reads as "nothing here was mappable" rather than "there was no ID column".
+    Observed for real on a 17,431-column MYODRAFT export (2026-09): a
+    de-identified/anonymised dump had no patient or record ID field at all.
+    A synthetic ID is the only way to get any output at all in that case, so
+    not backfilling one is strictly worse.
+
+    CAVEAT this function cannot make safe by itself — callers must surface it,
+    not just log it: the synthetic ID is row POSITION, not a real registry
+    identity. It is stable across CARE-SM model CSVs generated from THIS SAME
+    file in THIS SAME row order in one run family (so Phenotype.csv row N and
+    Diagnosis.csv row N do refer to the same patient) — but it will NOT match
+    up with a previous run's IDs if the source file is ever re-sorted,
+    filtered, or re-exported. Never treat it as a persistent patient
+    identifier outside the run that produced it.
+
+    Returns (headers, body, results, injected: bool).
+    """
+    if any(r["lane"] == "KEY" for r in results):
+        return headers, body, results, False
+
+    width = max(len(str(len(body))), 4)
+    synthetic_col = "synthetic_row_id"
+    new_headers = [synthetic_col] + headers
+    new_body = [[f"ROW_{i + 1:0{width}d}"] + row for i, row in enumerate(body)]
+    synthetic_result = {
+        "column": synthetic_col, "lane": "KEY", "care_sm_model": "pid",
+        "confidence": "high", "review": True, "n_nonnull": len(body),
+        "n_distinct": len(body), "sample": new_body[0][0:1] if new_body else [],
+        "unit": None,
+        "note": "SYNTHETIC — no patient/record identifier column was found in "
+                "the source file; this is a row-position placeholder, not a "
+                "real registry ID. Stable only within this run's outputs; "
+                "do not treat as stable across re-exports or re-runs.",
+    }
+    new_results = [synthetic_result] + results
+    return new_headers, new_body, new_results, True
+
+
+def collect_literal_queries(headers, body, args):
+    """Free (StubSearcher, no network) dry run purely to learn each column's
+    lane — lane routing is decided by value SHAPE (is it mostly numeric? a
+    small vocabulary? Yes/No tokens?), never by what a searcher returns, so
+    any searcher gives the same lane for the same data. Returns (dry-run
+    results, the literal query set). The dry-run results are NOT a substitute
+    for the real classify() pass — model/confidence *within* a lane can
+    depend on actual search scores — only the lane assignment is reusable."""
+    stub = StubSearcher()
+    dry_results = []
+    queries = set()
+    for i, h in enumerate(headers):
+        vals = nonnull(col_values(body, i))
+        r = classify(h, col_values(body, i), stub, args, idx=i)
+        dry_results.append(r)
+        queries |= literal_queries_for_column(h, vals, r["lane"], args)
+    return dry_results, queries
+
+
 def _fmt_hit(hit):
     if not hit:
         return None
@@ -450,13 +693,35 @@ def main():
     ap.add_argument("--json", help="also write full evidence to this JSON path")
     ap.add_argument("--data-dictionary", dest="data_dictionary",
                     help="write a per-column data dictionary (variable spec) to this JSON path")
+    ap.add_argument("--batch-size", type=int, default=256,
+                    help="queries per prewarm round trip against a live search service")
+    ap.add_argument("--no-prewarm", action="store_true",
+                    help="skip batch prewarming and query the network one column at a time "
+                         "(slow on wide datasets — see prewarm() docstring)")
     args = ap.parse_args()
 
     searcher = StubSearcher() if args.offline else HttpSearcher(args.search_url)
     headers, body, delim = load_table(args.file)
     if not headers:
         sys.exit(f"No data found in {args.file}")
+
+    t0 = time.time()
+    if isinstance(searcher, HttpSearcher) and not args.no_prewarm:
+        _, queries = collect_literal_queries(headers, body, args)
+        print(f"Offline triage: {time.time() - t0:.1f}s (free, no network) "
+              f"-> {len(queries)} unique live queries needed", file=sys.stderr)
+        searcher.prewarm(queries, batch_size=args.batch_size)
+
     results = [classify(h, col_values(body, i), searcher, args, idx=i) for i, h in enumerate(headers)]
+    if isinstance(searcher, HttpSearcher):
+        print(f"Total profiling time: {time.time() - t0:.1f}s", file=sys.stderr)
+
+    headers, body, results, synthetic_pid = ensure_pid_column(headers, body, results)
+    if synthetic_pid:
+        print("WARNING: no patient/record identifier column found — synthesized one "
+              "from row position ('synthetic_row_id'). See ensure_pid_column() docstring: "
+              "this ID is not a real registry identifier and is not stable across re-runs.",
+              file=sys.stderr)
 
     print_report(args.file, delim, headers, results, args)
     if args.json:

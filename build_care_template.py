@@ -31,6 +31,8 @@ import argparse
 import csv
 import os
 import re
+import sys
+import time
 from collections import Counter
 from types import SimpleNamespace
 
@@ -48,21 +50,28 @@ TOOLKIT_COLUMNS = {
     "output_id", "cause_id",
 }
 
-# Per-model column list = exactly the v2 example CSV header for that model.
+# Per-model column list = exactly the v2 example CSV header for that model,
+# plus `comments` — confirmed Optional (not Unused) for all 7 of these models
+# in the CARE-SM v2 glossary (docs/glossary.md in the CARE-Semantic-Model-
+# Version-2 repo; checked 2026-09 rather than assumed, per the lesson in
+# PIPELINE.md §5.3 about guessing which fields belong). Used to carry the
+# synthetic-PID note (see with_comments()) and, in future, real free-text
+# comment content once a builder has any to put there.
 MODEL_COLUMNS = {
     "Phenotype": ["model", "pid", "startdate", "enddate", "event_id", "target",
                   "value", "value_datatype", "duration_value",
-                  "duration_startdate", "duration_enddate"],
+                  "duration_startdate", "duration_enddate", "comments"],
     "Diagnosis": ["model", "pid", "startdate", "enddate", "event_id", "target",
-                  "value", "value_datatype"],
-    "Sex": ["model", "pid", "startdate", "enddate", "event_id", "attribute_type"],
-    "Status": ["model", "pid", "value_datatype", "startdate", "enddate", "event_id", "attribute_type"],
+                  "value", "value_datatype", "comments"],
+    "Sex": ["model", "pid", "startdate", "enddate", "event_id", "attribute_type", "comments"],
+    "Status": ["model", "pid", "value_datatype", "startdate", "enddate", "event_id",
+               "attribute_type", "comments"],
     "Birthdate": ["model", "pid", "value_datatype", "startdate", "enddate",
-                  "event_id", "value"],
+                  "event_id", "value", "comments"],
     "Deathdate": ["model", "pid", "value_datatype", "startdate", "enddate",
-                  "event_id", "value", "cause_id"],
+                  "event_id", "value", "cause_id", "comments"],
     "Symptoms_onset": ["model", "pid", "value_datatype", "startdate", "enddate",
-                       "event_id", "value", "target"],
+                       "event_id", "value", "target", "comments"],
 }
 # fail fast if a model list ever drifts outside the enforced set
 for _m, _cols in MODEL_COLUMNS.items():
@@ -92,6 +101,25 @@ def split_parts(cell):
 
 def pick_pid(results):
     return next((r["column"] for r in results if r["lane"] == "KEY"), None)
+
+
+SYNTHETIC_PID_COMMENT = "synthetic patient ID — no ID column found in source data"
+
+
+def with_comments(row, args, extra_comment=None):
+    """Attach a `comments` field to an emitted row dict: a synthetic-PID note
+    when this run used one (see pc.ensure_pid_column), concatenated with any
+    real free-text comment content a builder supplies via `extra_comment` --
+    none do yet, but this keeps that path from silently overwriting the
+    synthetic-PID note once one does."""
+    parts = []
+    if getattr(args, "synthetic_pid", False):
+        parts.append(SYNTHETIC_PID_COMMENT)
+    if extra_comment:
+        parts.append(extra_comment)
+    if parts:
+        row["comments"] = "; ".join(parts)
+    return row
 
 
 def generic_date_col(results):
@@ -149,14 +177,23 @@ def build_phenotype(headers, body, results, searcher, args):
     stats["_flags"] = ", ".join(r["column"] for r in flags) or "(none)"
 
     def hpo(term):
-        hit = searcher.top(term)
-        if hit and "_error" not in hit and hit.get("prefix") == "hp" and hit.get("score", 0) >= args.score:
+        # filter to same-ontology candidates BEFORE rerank: an exact-label
+        # match in a different ontology (e.g. "ophthalmoplegia" also exists
+        # as a MONDO disease term) must not steal the slot from a same-
+        # ontology candidate at rank 2/3 — it would just return None instead.
+        candidates = [c for c in searcher.top_k(term, k=3) if c and c.get("prefix") == "hp"]
+        hit, reranked = pc.pick_exact_match(term, candidates, args.score)
+        if reranked:
+            stats["reranked_exact_match"] += 1
+        if hit and "_error" not in hit and hit.get("score", 0) >= args.score:
             return hit["iri"]
         return None
 
     def emit(pid, iri, value, date):
-        return {"model": "Phenotype", "pid": pid, "target": iri, "value": value,
-                "value_datatype": "xsd:boolean", "startdate": date, "enddate": date}
+        return with_comments(
+            {"model": "Phenotype", "pid": pid, "target": iri, "value": value,
+             "value_datatype": "xsd:boolean", "startdate": date, "enddate": date},
+            args)
 
     rows = []
     for row in body:
@@ -228,14 +265,19 @@ def build_diagnosis(headers, body, results, searcher, args):
     stats["_freetext"] = ", ".join(r["column"] for r in freetext_cols) or "(none)"
 
     def mondo(term):
-        hit = searcher.top(term)
-        if hit and "_error" not in hit and hit.get("prefix") == "mondo" and hit.get("score", 0) >= args.score:
+        candidates = [c for c in searcher.top_k(term, k=3) if c and c.get("prefix") == "mondo"]
+        hit, reranked = pc.pick_exact_match(term, candidates, args.score)
+        if reranked:
+            stats["reranked_exact_match"] += 1
+        if hit and "_error" not in hit and hit.get("score", 0) >= args.score:
             return hit["iri"]
         return None
 
     def emit(pid, iri, date):
-        return {"model": "Diagnosis", "pid": pid, "target": iri, "value": "true",
-                "value_datatype": "xsd:boolean", "startdate": date, "enddate": date}
+        return with_comments(
+            {"model": "Diagnosis", "pid": pid, "target": iri, "value": "true",
+             "value_datatype": "xsd:boolean", "startdate": date, "enddate": date},
+            args)
 
     rows = []
     for row in body:
@@ -307,8 +349,9 @@ def build_sex(headers, body, results, searcher, args):
                 stats["unmapped_skipped"] += 1
                 continue
             date = row[colidx[bdate]].strip() if bdate else ""
-            rows.append({"model": "Sex", "pid": pid, "attribute_type": iri,
-                         "startdate": date, "enddate": date})
+            rows.append(with_comments(
+                {"model": "Sex", "pid": pid, "attribute_type": iri,
+                 "startdate": date, "enddate": date}, args))
             seen.add(pid)
             stats["emitted"] += 1
     return rows, stats
@@ -339,14 +382,15 @@ def build_status(headers, body, results, searcher, args):
                 stats["unmapped_skipped"] += 1
                 continue
             d = row[colidx[sdate]].strip() if sdate else ""
-            rows.append({"model": "Status", "pid": pid, "value_datatype": "xsd:string",
-                         "attribute_type": iri, "startdate": d, "enddate": d})
+            rows.append(with_comments(
+                {"model": "Status", "pid": pid, "value_datatype": "xsd:string",
+                 "attribute_type": iri, "startdate": d, "enddate": d}, args))
             stats["emitted"] += 1
     return rows, stats
 
 
 # ============================================================ date models ====
-def _simple_date_model(model, headers, body, results):
+def _simple_date_model(model, headers, body, results, args):
     """Birthdate / Deathdate: value = the date (xsd:date); startdate=enddate =
     the date. Skips patients with no date."""
     colidx = {h: i for i, h in enumerate(headers)}
@@ -364,18 +408,19 @@ def _simple_date_model(model, headers, body, results):
         if not d:
             stats["blank_skipped"] += 1
             continue
-        rows.append({"model": model, "pid": pid, "value": d,
-                     "value_datatype": "xsd:date", "startdate": d, "enddate": d})
+        rows.append(with_comments(
+            {"model": model, "pid": pid, "value": d,
+             "value_datatype": "xsd:date", "startdate": d, "enddate": d}, args))
         stats["emitted"] += 1
     return rows, stats
 
 
 def build_birthdate(headers, body, results, searcher, args):
-    return _simple_date_model("Birthdate", headers, body, results)
+    return _simple_date_model("Birthdate", headers, body, results, args)
 
 
 def build_deathdate(headers, body, results, searcher, args):
-    return _simple_date_model("Deathdate", headers, body, results)
+    return _simple_date_model("Deathdate", headers, body, results, args)
 
 
 def build_symptoms_onset(headers, body, results, searcher, args):
@@ -399,11 +444,45 @@ def build_symptoms_onset(headers, body, results, searcher, args):
             stats["blank_skipped"] += 1
             continue
         rec = row[colidx[stamp]].strip() if stamp else ""
-        rows.append({"model": "Symptoms_onset", "pid": pid, "value": onset,
-                     "value_datatype": "xsd:date", "startdate": rec or onset,
-                     "enddate": rec or onset})
+        rows.append(with_comments(
+            {"model": "Symptoms_onset", "pid": pid, "value": onset,
+             "value_datatype": "xsd:date", "startdate": rec or onset,
+             "enddate": rec or onset}, args))
         stats["emitted"] += 1
     return rows, stats
+
+
+# ==================================================== query prewarming =======
+def collect_builder_queries(headers, body, results):
+    """Full (uncapped) query set build_phenotype/build_diagnosis will need,
+    at per-ROW granularity. profile_columns.py's own dry-run (collect_literal_
+    queries) only samples up to args.sample distinct values per column, which
+    is fine for triage — but these builders walk every row of every patient,
+    so on a dataset with more distinct values in a column than the triage
+    sample cap, relying on the triage set alone would still leak one-at-a-
+    time network calls during the actual build. Only Phenotype/Diagnosis
+    SEARCH-lane columns call the searcher in these builders — Sex, Status,
+    Birthdate, Deathdate and Symptoms_onset use no live search at all."""
+    colidx = {h: i for i, h in enumerate(headers)}
+    queries = set()
+
+    for r in results:
+        if r["lane"] != "SEARCH":
+            continue
+        model = r.get("care_sm_model")
+        if model not in ("Phenotype", "Diagnosis"):
+            continue
+        ci = colidx[r["column"]]
+        for row in body:
+            cell = row[ci].strip()
+            if not cell:
+                continue
+            for part in split_parts(cell):
+                if model == "Phenotype" and NEG_RE.match(part):
+                    part = NEG_RE.sub("", part, count=1).strip()
+                if part:
+                    queries.add(part)
+    return queries
 
 
 BUILDERS = {
@@ -424,6 +503,10 @@ def main():
     ap.add_argument("--hit-fraction", dest="hit_fraction", type=float, default=pc.HIT_FRACTION)
     ap.add_argument("--small-vocab", dest="small_vocab", type=int, default=pc.SMALL_VOCAB_MAX)
     ap.add_argument("--sample", dest="sample", type=int, default=pc.SAMPLE_VALUES)
+    ap.add_argument("--batch-size", type=int, default=256,
+                    help="queries per prewarm round trip against a live search service")
+    ap.add_argument("--no-prewarm", action="store_true",
+                    help="skip batch prewarming and query the network one at a time")
     a = ap.parse_args()
 
     args = SimpleNamespace(score=a.score, hit_fraction=a.hit_fraction,
@@ -433,10 +516,35 @@ def main():
     headers, body, _ = pc.load_table(a.file)
     if not headers:
         raise SystemExit(f"No data found in {a.file}")
+
+    t0 = time.time()
+    if isinstance(searcher, pc.HttpSearcher) and not a.no_prewarm:
+        _, triage_queries = pc.collect_literal_queries(headers, body, args)
+        print(f"Offline triage: {time.time() - t0:.1f}s (free, no network) "
+              f"-> {len(triage_queries)} unique live queries needed", file=sys.stderr)
+        searcher.prewarm(triage_queries, batch_size=a.batch_size)
+
     results = [pc.classify(h, pc.col_values(body, i), searcher, args, idx=i)
                for i, h in enumerate(headers)]
 
+    headers, body, results, args.synthetic_pid = pc.ensure_pid_column(headers, body, results)
+    if args.synthetic_pid:
+        print("WARNING: no patient/record identifier column found in the source file — "
+              "synthesized one from row position (column 'synthetic_row_id'). This ID is "
+              "NOT a real registry identifier: it is only stable across the CARE-SM model "
+              "CSVs produced by THIS run, not across re-exports or re-runs. Every emitted "
+              f"row's `comments` field notes this ({SYNTHETIC_PID_COMMENT!r}). See "
+              "ensure_pid_column()'s docstring in profile_columns.py.", file=sys.stderr)
+
+    if isinstance(searcher, pc.HttpSearcher) and not a.no_prewarm:
+        # second pass: the builders below walk every ROW (uncapped), which can
+        # need queries beyond profile_columns.py's own triage sample cap.
+        builder_queries = collect_builder_queries(headers, body, results)
+        searcher.prewarm(builder_queries, batch_size=a.batch_size)
+
     rows, stats = BUILDERS[a.model](headers, body, results, searcher, args)
+    if isinstance(searcher, pc.HttpSearcher):
+        print(f"Total build time: {time.time() - t0:.1f}s", file=sys.stderr)
     os.makedirs(a.out, exist_ok=True)
     outpath = os.path.join(a.out, f"{a.model}.csv")
     header = write_model_csv(a.model, rows, outpath)

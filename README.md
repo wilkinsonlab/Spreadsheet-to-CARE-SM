@@ -104,11 +104,58 @@ information are ever included in those lookups.
 ## What comes out the other end isn't automatically "done"
 
 This tool proposes a translation of your data — it does not make final
-clinical or coding decisions on its own. Every value it wasn't fully confident
-about is written into a separate review file so a human with the right
-clinical/data knowledge can check it before anything is treated as final. The
-goal is to remove the tedious, repetitive 95% of the work, not to remove the
-person who understands the data.
+clinical or coding decisions on its own. The goal is to remove the tedious,
+repetitive 95% of the work, not to remove the person who understands the
+data.
+
+### Where the "needs a human to check this" items end up
+
+Anything the tool wasn't genuinely confident about is **not** included in the
+finished CARE-SM files at all — it's left out of that output entirely, rather
+than included with a "maybe" flag attached. Where to actually find it:
+
+- **The curation workbook** — the `.xlsx` file you name with `-o` when you run
+  `build_curation_workbook.py` (`review.xlsx` in the example above). This is
+  the main "for a human to check" artifact: one row per uncertain column or
+  value, with a locked drop-down for a reviewer's verdict.
+- **The column-triage report** — printed to your screen by `profile_columns.py`
+  by default, or saved as a file if you add `--json report.json`. Useful for
+  understanding *why* the tool made a particular call, column by column.
+- **The run's own summary counts** — every time `build_care_template.py` runs,
+  it prints how many rows it emitted and how many it skipped, and why
+  (e.g. "skipped: gene could not be resolved"). Worth reading after every run,
+  not just once.
+
+### There is currently no automated way to feed corrections back in
+
+Once a human has reviewed the curation workbook, **there is no "apply my
+corrections" step today.** The current, entirely manual workflow is:
+
+1. A person reviews the flagged items and works out what should actually
+   happen for each one.
+2. They fix the *source spreadsheet* by hand (correcting a value, renaming a
+   column, filling in something that was missing, etc.) — or, if the same
+   kind of thing is likely to recur, someone technical updates the tool's own
+   mapping files (`column_mappings.json`/`care_template_mappings.json`) so
+   the fix applies automatically next time.
+3. The whole transformation is **run again from scratch** on the corrected
+   spreadsheet.
+
+There's no partial re-run and no way to hand the reviewed workbook back to the
+tool yet — every fix currently has to be made upstream of it. A "patching"
+workflow that reads the reviewed workbook and reapplies corrections
+automatically is planned, but doesn't exist yet.
+
+**Why that's harder than it sounds:** not every entry in the review workbook
+is something that can be "corrected" at all. Some of them mean "this value has
+no matching concept in NMDO" — and the fix for *that* isn't a data correction
+on your end, it's a request to add a new term to the ontology itself, which
+only NMDO's own maintainers can do. There is, as of now, no defined process
+for routing those specific findings to the NMDO team, and until a term
+actually gets added to the ontology, no amount of re-running this tool will
+resolve that particular item. Building that piece — deciding which review
+items are "fixable here" versus "needs the ontology itself extended
+elsewhere," and how the second kind gets routed and tracked — is future work.
 
 ---
 

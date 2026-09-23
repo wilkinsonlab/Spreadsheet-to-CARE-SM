@@ -213,6 +213,26 @@ automatically.
 - Stdlib-only Python 3 for the tools themselves; nothing to install to run
   them (see `requirements.txt`).
 
+## Contributions
+
+**Mark Wilkinson** ([@markwilkinson](https://github.com/markwilkinson)):
+
+- Original design and architecture: the initial set of hypotheses about how a
+  spreadsheet-to-CARE-SM pipeline could work (see "The original speculations,
+  tested" in [`docs/PIPELINE.md`](docs/PIPELINE.md))
+- Direction on the gene/variant/zygosity design (which external lookup
+  services to use — mygene.info, myvariant.info, the GENO ontology — and how
+  they should combine)
+- CARE-SM modelling decisions the output has to respect (e.g. that
+  `Genetic.target` must be Mandatory)
+- Review and correction of design choices and documentation throughout
+
+**Claude** (Anthropic):
+
+- Implementation of the pipeline (`src/`)
+- Test suite (`tests/`)
+- Documentation (`docs/`, this README)
+
 ## License
 
 [MIT](LICENSE) — see the LICENSE file.

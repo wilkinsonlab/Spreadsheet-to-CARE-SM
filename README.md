@@ -42,7 +42,8 @@ your registry's IT/data-management team)** — this tool picks up only once
 that flat file exists, and trusts that whoever produced it made sensible
 decisions about how to flatten it.
 
-**CARE-SM** (the Clinical And Registry Entries Semantic Model) is a shared,
+**[CARE-SM](https://github.com/wilkinsonlab/CARE-Semantic-Model-Version-2)**
+(the Clinical And Registry Entries Semantic Model) is a shared,
 standard way of describing patient information — diagnoses, symptoms, lab
 results, genetic findings, and more — so that data collected by different
 clinics, in different countries, using completely different systems, can

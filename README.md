@@ -22,19 +22,33 @@
 
 ## What this is for
 
-If you run a patient registry, you've almost certainly lived through this: your
-data lives in a spreadsheet, and at some point you need to share it, combine it
-with another registry's data, or feed it into a research database — and that
-means turning your spreadsheet into a format that other systems can actually
-understand.
+Most patient registries don't actually live in a spreadsheet — they live in a
+database, structured however that particular registry's software was built:
+patients, visits, repeated questionnaires, linked forms, and so on. That
+structure is usually nothing like a flat spreadsheet, and **this tool has no
+way to understand it directly** — it doesn't connect to databases, and it
+knows nothing about your particular system's underlying data model. The core
+mismatch is a real one: a database's entities and relationships and a
+spreadsheet's flat rows-and-columns are simply not the same kind of thing, and
+no tool can safely guess how to collapse one into the other on your behalf.
+
+What this tool *does* understand is a flat spreadsheet export — one sheet,
+one row per observation (for example, one row per patient, or one row per
+patient per visit), one column per piece of information. Almost every
+registry system, however it's built, can produce an export roughly this
+shape — even though doing so means flattening or simplifying some of the
+richer structure held in the real database. **That export step is on you (or
+your registry's IT/data-management team)** — this tool picks up only once
+that flat file exists, and trusts that whoever produced it made sensible
+decisions about how to flatten it.
 
 **CARE-SM** (the Clinical And Registry Entries Semantic Model) is a shared,
 standard way of describing patient information — diagnoses, symptoms, lab
 results, genetic findings, and more — so that data collected by different
-clinics, in different countries, using completely different spreadsheets, can
+clinics, in different countries, using completely different systems, can
 still be compared, combined, and understood correctly by everyone.
 
-This tool takes a real, messy spreadsheet export and does the tedious,
+This tool takes that flat spreadsheet export and does the tedious,
 error-prone translation work for you: it looks at each column, works out what
 kind of clinical information it holds, and converts it into the standard
 CARE-SM format — ready to be shared, combined, or analysed alongside data from
@@ -65,6 +79,9 @@ Give it a spreadsheet export, and it will:
 
 ## What it will never do
 
+- **It will never connect to your registry's database, or attempt to work out
+  its structure on your behalf.** It only reads the flat spreadsheet export
+  you give it — see "What this is for" above.
 - **It will never silently guess.** Anything the tool isn't genuinely
   confident about is flagged for a human to check, not quietly turned into an
   answer that looks plausible but might be wrong.

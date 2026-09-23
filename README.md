@@ -216,3 +216,6 @@ automatically.
 ## License
 
 [MIT](LICENSE) — see the LICENSE file.
+
+## Upcoming Changes
+This needs to be dockerized, so that anyone can run it, regardless of what coding languages they have installed.

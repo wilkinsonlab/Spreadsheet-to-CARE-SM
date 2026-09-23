@@ -4,7 +4,9 @@
 > registries.** Most of the "which standard code does this diagnosis/symptom
 > match?" work in this tool is done by sending a short query to a lookup
 > service that has been loaded with a specific medical reference vocabulary
-> — one built for neuromuscular disease (called **NMDO**). Out of the box,
+> — one built for neuromuscular disease, called
+> [**NMDO**](https://github.com/NeuromuscularDisease/neuromuscular-disease-ontology).
+> Out of the box,
 > this tool will therefore be much better at recognising neuromuscular
 > diagnoses and symptoms than, say, cardiology or oncology ones. (Gene, gene
 > variant, and gene-zygosity lookups are the exception — those always use

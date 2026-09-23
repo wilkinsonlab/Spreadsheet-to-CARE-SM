@@ -1,0 +1,35 @@
+{
+  "_readme": "Domain-knowledge lookup tables for build_care_template.py's CARE-SM row emission. Edit THIS FILE, not the Python code, to add a CURIE prefix, a sex/status value synonym, or an affirmative/negative token. Does NOT include TOOLKIT_COLUMNS/MODEL_COLUMNS -- those are the v2 Toolkit's own enforced column contract, copied from its source/example CSVs, not a curation decision, and stay in build_care_template.py.",
+
+  "curie_expand": {
+    "_readme": "diagnosis-code prefix -> IRI template ({} is replaced with the local part)",
+    "ORPHA": "http://www.orpha.net/ORDO/Orphanet_{}",
+    "ORPHANET": "http://www.orpha.net/ORDO/Orphanet_{}",
+    "MONDO": "http://purl.obolibrary.org/obo/MONDO_{}",
+    "OMIM": "https://www.omim.org/entry/{}",
+    "ICD10": "http://purl.bioontology.org/ontology/ICD10/{}"
+  },
+
+  "sex_map": {
+    "_readme": "lowercased cell value -> NCIT IRI, emitted on Sex.attribute_type",
+    "male": "http://purl.obolibrary.org/obo/NCIT_C20197",
+    "m": "http://purl.obolibrary.org/obo/NCIT_C20197",
+    "female": "http://purl.obolibrary.org/obo/NCIT_C16576",
+    "f": "http://purl.obolibrary.org/obo/NCIT_C16576"
+  },
+
+  "status_label_iri": {
+    "alive": "http://semanticscience.org/resource/SIO_010058",
+    "dead": "http://semanticscience.org/resource/SIO_010059"
+  },
+  "status_map": {
+    "_readme": "lowercased cell value -> status_label_iri key",
+    "yes": "alive", "alive": "alive", "living": "alive",
+    "no": "dead", "dead": "dead", "deceased": "dead"
+  },
+  "status_header_pattern": "\\b(alive|vital\\s*status|life\\s*status)\\b",
+
+  "affirmative_tokens": ["yes", "true", "present", "positive", "y"],
+  "negative_tokens": ["no", "false", "absent", "negative", "n"],
+  "negation_pattern": "^(no|not|without|denies|denied|absent|negative for|no evidence of)\\b"
+}

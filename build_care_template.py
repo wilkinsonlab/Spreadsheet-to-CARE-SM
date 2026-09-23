@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -37,6 +38,27 @@ from collections import Counter
 from types import SimpleNamespace
 
 import profile_columns as pc
+
+# ---- domain-knowledge lookup tables -------------------------------------------
+# CURIE prefixes, sex/status value vocab, affirmative/negative tokens: all live
+# in care_template_mappings.json, NOT here — see that file's _readme. Only the
+# v2 Toolkit's enforced column contract (TOOLKIT_COLUMNS/MODEL_COLUMNS, below)
+# stays in code: it's copied from the Toolkit's own source/example CSVs, not a
+# curation decision.
+_MAPPINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "care_template_mappings.json")
+with open(_MAPPINGS_PATH) as _f:
+    _M = json.load(_f)
+
+CURIE_EXPAND = {k: v for k, v in _M["curie_expand"].items() if not k.startswith("_")}
+SEX_MAP = {k: v for k, v in _M["sex_map"].items() if not k.startswith("_")}
+_STATUS_LABEL_IRI = _M["status_label_iri"]
+SIO_ALIVE = _STATUS_LABEL_IRI["alive"]
+SIO_DEAD = _STATUS_LABEL_IRI["dead"]
+STATUS_MAP = {v: _STATUS_LABEL_IRI[label] for v, label in _M["status_map"].items() if not v.startswith("_")}
+STATUS_HEADER_RE = re.compile(_M["status_header_pattern"], re.I)
+AFFIRMATIVE = set(_M["affirmative_tokens"])
+NEGATIVE = set(_M["negative_tokens"])
+NEG_RE = re.compile(_M["negation_pattern"], re.I)
 
 # ---- v2 Toolkit column contract ---------------------------------------------
 # The full set the v2 Toolkit accepts (toolkit/main.py `self.columns`). Any
@@ -72,6 +94,8 @@ MODEL_COLUMNS = {
                   "event_id", "value", "cause_id", "comments"],
     "Symptoms_onset": ["model", "pid", "value_datatype", "startdate", "enddate",
                        "event_id", "value", "target", "comments"],
+    "Genetic": ["model", "pid", "event_id", "target", "attribute_type",
+                "identifier_value", "comments"],
 }
 # fail fast if a model list ever drifts outside the enforced set
 for _m, _cols in MODEL_COLUMNS.items():
@@ -90,9 +114,6 @@ def write_model_csv(model, rowdicts, path):
 
 
 # ---- shared helpers ----------------------------------------------------------
-NEG_RE = re.compile(r"^(no|not|without|denies|denied|absent|negative for|no evidence of)\b", re.I)
-AFFIRMATIVE = {"yes", "true", "present", "positive", "y"}
-NEGATIVE = {"no", "false", "absent", "negative", "n"}
 
 
 def split_parts(cell):
@@ -230,14 +251,6 @@ def build_phenotype(headers, body, results, searcher, args):
 
 
 # ============================================================ Diagnosis ======
-CURIE_EXPAND = {
-    "ORPHA": "http://www.orpha.net/ORDO/Orphanet_{}",
-    "ORPHANET": "http://www.orpha.net/ORDO/Orphanet_{}",
-    "MONDO": "http://purl.obolibrary.org/obo/MONDO_{}",
-    "OMIM": "https://www.omim.org/entry/{}",
-    "ICD10": "http://purl.bioontology.org/ontology/ICD10/{}",
-}
-
 
 def expand_curie(value):
     if ":" not in value:
@@ -311,19 +324,8 @@ def build_diagnosis(headers, body, results, searcher, args):
 
 # ============================================================ Sex / Status ===
 # v2: the categorical concept goes in `attribute_type` (was v1 valueIRI).
-SEX_MAP = {
-    "male": "http://purl.obolibrary.org/obo/NCIT_C20197",
-    "m": "http://purl.obolibrary.org/obo/NCIT_C20197",
-    "female": "http://purl.obolibrary.org/obo/NCIT_C16576",
-    "f": "http://purl.obolibrary.org/obo/NCIT_C16576",
-}
-SIO_ALIVE = "http://semanticscience.org/resource/SIO_010058"  # "alive"
-SIO_DEAD = "http://semanticscience.org/resource/SIO_010059"    # "dead"
-STATUS_MAP = {
-    "yes": SIO_ALIVE, "alive": SIO_ALIVE, "living": SIO_ALIVE,
-    "no": SIO_DEAD, "dead": SIO_DEAD, "deceased": SIO_DEAD,
-}
-STATUS_HEADER_RE = re.compile(r"\b(alive|vital\s*status|life\s*status)\b", re.I)
+# SEX_MAP/SIO_ALIVE/SIO_DEAD/STATUS_MAP/STATUS_HEADER_RE are loaded from
+# care_template_mappings.json above.
 
 
 def build_sex(headers, body, results, searcher, args):
@@ -452,6 +454,113 @@ def build_symptoms_onset(headers, body, results, searcher, args):
     return rows, stats
 
 
+# ============================================================== Genetic ======
+# Unspecified-zygosity IRI (GENO_0000137) -- the intended default whenever a
+# gene is resolved but no separate zygosity column/value exists, or the
+# zygosity column's value isn't in the GENO vocabulary (see column_mappings.
+# json's zygosity_values._readme and the gene/variant/zygosity triad design
+# notes). This mirrors pc.GENO_BASE + "GENO_0000137" but is spelled out here
+# rather than imported, since it's a fixed constant this builder owns.
+UNSPECIFIED_ZYGOSITY_IRI = "http://purl.obolibrary.org/obo/GENO_0000137"
+
+
+def build_genetic(headers, body, results, searcher, args):
+    """Emits Genetic.csv rows per the gene/variant/zygosity truth table
+    (project design notes, 2026-09-23):
+
+      gene alone            -> target=gene, attribute_type=unspecified, identifier_value=blank
+      gene + variant         -> target=gene, attribute_type=unspecified, identifier_value=variant
+      gene + zygosity         -> target=gene, attribute_type=zygosity,    identifier_value=blank
+      gene + variant + zygosity -> target=gene, attribute_type=zygosity, identifier_value=variant
+      variant alone (+/- zygosity) -> target derived FROM the variant (see
+          pc.resolve_variant_column); attribute_type=zygosity if present,
+          else unspecified; identifier_value=variant
+      zygosity alone (no gene, no variant) -> nonsense, no record possible
+      no gene AND no resolvable gene-from-variant -> SKIPPED, not emitted
+          with target blank -- CARE-SM v2's Genetic.target is Mandatory
+          (docs/glossary.md in CARE-Semantic-Model-Version-2): a variant/
+          zygosity report that isn't about any resolvable gene isn't a
+          meaningful Genetic record at all.
+
+    Reuses the per-column resolution profile_columns.py's classify() already
+    did (each GENE/VARIANT/ZYGOSITY column's `proposed_mappings`, a list of
+    {source: <raw value>, iri: <resolved IRI>} per distinct value) rather
+    than re-resolving anything live -- this builder is pure row-walking
+    business logic on top of already-classified/resolved columns, same
+    pattern as build_diagnosis's CURIE/freetext handling.
+
+    Multiple GENE, VARIANT, or ZYGOSITY columns in one file is not a case
+    this builder guesses at: it's flagged and NO rows are emitted, since
+    which column is authoritative is a human judgment call.
+    """
+    colidx = {h: i for i, h in enumerate(headers)}
+    pid_col = pick_pid(results)
+
+    gene_cols = [r for r in results if r["lane"] == "GENE"]
+    variant_cols = [r for r in results if r["lane"] == "VARIANT"]
+    zygosity_cols = [r for r in results if r["lane"] == "ZYGOSITY"]
+
+    stats = Counter()
+    stats["_pid"] = pid_col
+    stats["_gene_col"] = gene_cols[0]["column"] if len(gene_cols) == 1 else "(none)"
+    stats["_variant_col"] = variant_cols[0]["column"] if len(variant_cols) == 1 else "(none)"
+    stats["_zygosity_col"] = zygosity_cols[0]["column"] if len(zygosity_cols) == 1 else "(none)"
+
+    if len(gene_cols) > 1 or len(variant_cols) > 1 or len(zygosity_cols) > 1:
+        stats["skipped_ambiguous_columns"] = (
+            f"multiple columns in one lane (GENE={len(gene_cols)}, "
+            f"VARIANT={len(variant_cols)}, ZYGOSITY={len(zygosity_cols)}) -- "
+            "which is authoritative is a human judgment call, no rows emitted")
+        return [], stats
+
+    gene_col = gene_cols[0] if gene_cols else None
+    variant_col = variant_cols[0] if variant_cols else None
+    zygosity_col = zygosity_cols[0] if zygosity_cols else None
+
+    if not gene_col and not variant_col:
+        if zygosity_col:
+            stats["skipped_zygosity_alone"] = (
+                "zygosity column present with no gene or variant column -- "
+                "not a meaningful Genetic record on its own, skipped")
+        return [], stats
+
+    gene_map = {m["source"]: m["iri"] for m in (gene_col["proposed_mappings"] if gene_col else [])}
+    variant_gene_map = {m["source"]: m["iri"] for m in (variant_col["proposed_mappings"] if variant_col else [])}
+    zygosity_map = {m["source"]: m["iri"] for m in (zygosity_col["proposed_mappings"] if zygosity_col else [])}
+
+    rows = []
+    for row in body:
+        pid = row[colidx[pid_col]].strip() if pid_col else ""
+        if not pid:
+            continue
+
+        gene_val = row[colidx[gene_col["column"]]].strip() if gene_col else ""
+        variant_val = row[colidx[variant_col["column"]]].strip() if variant_col else ""
+        zygosity_val = row[colidx[zygosity_col["column"]]].strip() if zygosity_col else ""
+
+        # target: a direct Gene column is the more reliable source (see
+        # resolve_gene_column) -- only fall back to deriving the gene from
+        # the variant's own accession/rsID when there's no Gene column value.
+        target_iri = gene_map.get(gene_val) if gene_val else None
+        if not target_iri and variant_val:
+            target_iri = variant_gene_map.get(variant_val)
+
+        if not target_iri:
+            stats["skipped_no_resolvable_gene"] += 1
+            continue
+
+        attribute_type = zygosity_map.get(zygosity_val) if zygosity_val else None
+        if not attribute_type:
+            attribute_type = UNSPECIFIED_ZYGOSITY_IRI
+            stats["defaulted_unspecified_zygosity"] += 1
+
+        rows.append(with_comments(
+            {"model": "Genetic", "pid": pid, "target": target_iri,
+             "attribute_type": attribute_type, "identifier_value": variant_val}, args))
+        stats["emitted"] += 1
+    return rows, stats
+
+
 # ==================================================== query prewarming =======
 def collect_builder_queries(headers, body, results):
     """Full (uncapped) query set build_phenotype/build_diagnosis will need,
@@ -489,7 +598,23 @@ BUILDERS = {
     "Phenotype": build_phenotype, "Diagnosis": build_diagnosis, "Sex": build_sex,
     "Status": build_status, "Birthdate": build_birthdate,
     "Deathdate": build_deathdate, "Symptoms_onset": build_symptoms_onset,
+    "Genetic": build_genetic,
 }
+
+
+def build_resolvers(offline):
+    """Bug fix (2026-09-23): main() used to call pc.classify() with no
+    gene_resolver/myvariant_resolver at all, so classify() fell through to
+    its own defaults -- StubGeneResolver()/StubMyVariantResolver() -- on
+    EVERY run, live or not. A live (non---offline) run's GENE/VARIANT lanes
+    were silently resolved against the tiny hardcoded stub lexicons instead
+    of mygene.info/myvariant.info, while --offline behaved identically by
+    accident. profile_columns.py's own main() always got this right;
+    build_care_template.py's main() didn't. Extracted to its own function so
+    the offline/live choice is unit-testable without a full CLI run."""
+    if offline:
+        return pc.StubGeneResolver(), pc.StubMyVariantResolver()
+    return pc.GeneResolver(), pc.MyVariantResolver()
 
 
 def main():
@@ -513,6 +638,7 @@ def main():
                            small_vocab=a.small_vocab, sample=a.sample,
                            offline=a.offline, search_url=a.search_url)
     searcher = pc.StubSearcher() if a.offline else pc.HttpSearcher(a.search_url)
+    gene_resolver, myvariant_resolver = build_resolvers(a.offline)
     headers, body, _ = pc.load_table(a.file)
     if not headers:
         raise SystemExit(f"No data found in {a.file}")
@@ -524,7 +650,8 @@ def main():
               f"-> {len(triage_queries)} unique live queries needed", file=sys.stderr)
         searcher.prewarm(triage_queries, batch_size=a.batch_size)
 
-    results = [pc.classify(h, pc.col_values(body, i), searcher, args, idx=i)
+    results = [pc.classify(h, pc.col_values(body, i), searcher, args, idx=i,
+                           gene_resolver=gene_resolver, myvariant_resolver=myvariant_resolver)
                for i, h in enumerate(headers)]
 
     headers, body, results, args.synthetic_pid = pc.ensure_pid_column(headers, body, results)

@@ -1,0 +1,104 @@
+{
+  "_readme": "Domain-knowledge lookup tables for profile_columns.py's column-triage pipeline. Edit THIS FILE, not the Python code, to add a header keyword, a value synonym, or a new gene/zygosity entry. All 'pattern' fields are case-insensitive regexes (Python re syntax) matched against a column header. The Python code that CONSUMES these tables -- including the reasoning behind thresholds, exclusions, and edge cases -- stays in profile_columns.py; this file is data only.",
+
+  "header_patterns": {
+    "pii": {
+      "pattern": "\\b(?:(?:first|last|middle|maiden|sur)\\s*name|full\\s*name|address|postcode|zip|phone|email|nhs\\s*number|ssn|initials)\\b",
+      "note": "direct identifier -> DROP, never mapped"
+    },
+    "key": {
+      "pattern": "\\b(patient\\s*id|pid|record\\s*id|subject\\s*id|^id$)\\b",
+      "note": "record/patient identifier column"
+    },
+    "gene": {
+      "pattern": "\\b(gene|genes|hgnc|locus|loci)\\b",
+      "note": "gene-symbol/gene-ID column. Deliberately does NOT match 'Genetic confirmation' -- the word-boundary after 'gene' requires a non-word character next, but 'genetic' continues with 't', so that column falls through to BOOLEAN instead. 'locus'/'loci'/'hgnc' cover common clinical-registry synonyms (Gene Symbol, Gene Name, Causative/Affected Gene, HGNC ID, Locus) without a bare 'symbol' pattern, which would false-positive on non-gene symbol columns."
+    },
+    "entrez_id_header": {
+      "pattern": "\\b(entrez|ncbi\\s*gene\\s*id|gene\\s*id|geneid)\\b",
+      "note": "Entrez Gene ID hint for numeric-ID gene columns. 'gene id'/'geneid' is NCBI's own column name for Entrez Gene ID exports, not a generic 'any gene identifier' pattern."
+    },
+    "hgnc_id_header": {
+      "pattern": "\\bhgnc\\b",
+      "note": "HGNC numeric-ID hint for numeric-ID gene columns"
+    },
+    "zygosity": {
+      "pattern": "\\b(zygosity|zygosity\\s*status|allele\\s*state|allelic\\s*state)\\b",
+      "note": "zygosity/allelic-state column (one leg of the gene/variant/zygosity triad)"
+    },
+    "variant": {
+      "pattern": "\\b(var|variant|variants|allele)\\b",
+      "note": "confirmatory ONLY, not definitive -- variant-column membership is decided by whether VALUES parse as HGVS/rsID notation (see VARIANT_VALUE_RE in code), because header naming for this leg of the gene/variant/zygosity triad is expected to be inconsistent across partners. When this header pattern and the value-shape test disagree, the column goes to human review rather than being auto-classified either way (decided 2026-09-23)."
+    }
+  },
+
+  "date_subtype": [
+    {"pattern": "death|deceased|died", "model": "Deathdate"},
+    {"pattern": "birth|dob|d\\.o\\.b", "model": "Birthdate"},
+    {"pattern": "onset", "model": "Symptoms_onset"},
+    {"pattern": "first\\s*visit|enrol|baseline", "model": "First_visit"},
+    {"pattern": "diagnos", "model": "Diagnosis"}
+  ],
+  "_date_subtype_note": "ORDER MATTERS -- checked top to bottom, first match wins.",
+
+  "boolean_tokens": [
+    "yes", "no", "y", "n", "true", "false", "positive", "negative",
+    "present", "absent", "unknown", "not applicable", "n/a", "na",
+    "carrier", "confirmed", "not confirmed"
+  ],
+
+  "sex_tokens": ["male", "female", "m", "f", "intersex", "other", "unknown"],
+
+  "numeric_sentinels": ["unable", "not done", "nd", "n/a", "na", "unknown", "missing"],
+
+  "zygosity_values": {
+    "_readme": "GENO ontology (purl.obolibrary.org/obo/GENO_nnnnnnn) zygosity terms. 'triggers' are matched EXACT-after-normalization (lowercase, punctuation/whitespace stripped) against a cell value -- never substring -- to avoid false hits like 'heterogeneous' matching on 'het'. A value not found in ANY entry here is left unmapped for human review, not guessed at -- see 'biallelic'/'monoallelic' which are deliberately excluded (clinically overloaded, meaning varies by lab convention).",
+    "GENO_0000134": {"label": "hemizygous", "triggers": ["hemi", "hemizygous", "hemizygote"]},
+    "GENO_0000135": {
+      "label": "heterozygous",
+      "triggers": ["het", "hetero", "heterozygous", "heterozygote"],
+      "note": "plain het/heterozygous ALWAYS resolves here -- never auto-inferred as compound (GENO_0000402) or simple (GENO_0000458, not in this table at all) without an explicit qualifier in the value. Decided 2026-09-23: don't guess at synonyms for terms not yet observed in partner data."
+    },
+    "GENO_0000402": {
+      "label": "compound heterozygous",
+      "triggers": ["compound het", "compound heterozygous", "trans-heterozygous", "trans heterozygous"],
+      "note": "'chet' deliberately excluded -- too collision-prone with unrelated abbreviations to trust as an exact-match trigger (2026-09-23)."
+    },
+    "GENO_0000136": {"label": "homozygous", "triggers": ["hom", "homo", "homozygous", "homozygote"]},
+    "GENO_0000978": {"label": "nullizygous", "triggers": ["null", "nullizygous", "homozygous null"]},
+    "GENO_0000137": {
+      "label": "unspecified zygosity",
+      "triggers": ["unknown", "unspecified", "indeterminate", "not determined", "nd", "n/a", "na",
+                    "not tested", "pending", "undetermined", "not stated"],
+      "note": "also the intended default when a gene is present with no zygosity column/value at all -- see the gene/variant/zygosity triad design notes"
+    }
+  },
+
+  "gene_stub_lexicon": {
+    "_readme": "Offline stand-in for mygene.info (StubGeneResolver) -- real NMD-panel gene symbols mapped to their HGNC numeric ID, captured live from mygene.info on 2026-09-23. NOT a substitute for the live resolver; used for --offline/demo/CI runs only.",
+    "ANO5": "27337", "CACNA1S": "1397", "COL6A1": "2211", "COL6A2": "2212",
+    "COL6A3": "2213", "DYSF": "3097", "FKRP": "17997", "FUS": "4010",
+    "GARS1": "4162", "GNE": "23657", "LMNA": "6636", "MFN2": "16877",
+    "MTM1": "7448", "PMP22": "9118", "RYR1": "10483", "SCN4A": "10591",
+    "SMN1": "11117", "SMN2": "11118", "SOD1": "11179",
+    "TP53": "11998", "TNF": "11892"
+  },
+
+  "transcript_stub_lexicon": {
+    "_readme": "Offline stand-in for mygene.info scope=refseq (StubGeneResolver, gene-from-variant path) -- unversioned RefSeq transcript accession -> gene symbol, captured live from mygene.info on 2026-09-23, all NMD-panel genes already in gene_stub_lexicon above.",
+    "NM_000334": "SCN4A", "NM_003494": "DYSF", "NM_170707": "LMNA"
+  },
+
+  "rsid_stub_lexicon": {
+    "_readme": "Offline stand-in for myvariant.info (StubMyVariantResolver) -- dbSNP rsID -> gene symbol, captured live from myvariant.info on 2026-09-23. NOT NMD-panel-specific (myvariant.info's own test examples) -- just enough to exercise the resolver offline. TP53/TNF are also added to gene_stub_lexicon below (HGNC 11998/11892, captured live) so the rsID->symbol->HGNC round trip fully resolves offline, not just the first hop.",
+    "rs1042522": "TP53", "rs1800629": "TNF"
+  },
+
+  "lane_to_vartype": {
+    "_readme": "Maps a column-triage lane to the variable-type vocabulary a generative model (DBM/VAE) would train from -- falls out of the same classification the CARE-SM mapping uses (dual-use).",
+    "BOOLEAN": "binary", "DICTIONARY": "categorical", "CURIE": "categorical",
+    "GENE": "categorical", "VARIANT": "categorical", "ZYGOSITY": "categorical",
+    "NUMERIC": "continuous", "DATE": "date",
+    "KEY": "identifier", "SEARCH": "freetext", "PII": "ignore", "DROP": "ignore"
+  }
+}

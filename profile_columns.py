@@ -34,6 +34,7 @@ import argparse
 import csv
 import io
 import json
+import os
 import re
 import sys
 import time
@@ -51,42 +52,118 @@ HIT_FRACTION = 0.60         # a column is SEARCH-mappable if >= this share hit
 SMALL_VOCAB_MAX = 12        # <= this many distinct values => controlled vocab
 SAMPLE_VALUES = 20          # distinct values sampled per column for searching
 
-# ---- lexical signals ---------------------------------------------------------
-PII_PATTERNS = re.compile(
-    r"\b(?:(?:first|last|middle|maiden|sur)\s*name|full\s*name|address|postcode|"
-    r"zip|phone|email|nhs\s*number|ssn|initials)\b", re.I)
-KEY_PATTERNS = re.compile(r"\b(patient\s*id|pid|record\s*id|subject\s*id|^id$)\b", re.I)
-# NB: \bgene\b deliberately does NOT match "Genetic confirmation" — the \b
-# after "gene" requires a non-word char next, but "genetic" continues with
-# "t". That column is a Yes/No flag and is caught by the BOOLEAN step instead.
-# "locus"/"loci" and "hgnc" cover common clinical-registry synonyms (Gene
-# Symbol, Gene Name, Causative/Affected Gene, HGNC ID, Locus) without a bare
-# "symbol" pattern, which would false-positive on non-gene symbol columns.
-GENE_PATTERNS = re.compile(r"\b(gene|genes|hgnc|locus|loci)\b", re.I)
+# ---- domain-knowledge lookup tables -------------------------------------------
+# All header-trigger patterns and value vocabularies live in column_mappings.json,
+# NOT here — so a curator can see/edit what maps to what without reading Python.
+# This module only holds parsing mechanics (generic regex, date formats) and the
+# CODE that consumes the loaded tables (thresholds, exclusion logic, rationale
+# for HOW a table is applied — see e.g. resolve_gene_column's docstring).
+DEFAULT_MAPPINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "column_mappings.json")
 
-# ID-space hints for a GENE-lane header, cheapest signal first (see
-# resolve_gene_column). "gene id"/"geneid" is an Entrez hint, not a generic
-# one: it's NCBI's own column name for their Entrez Gene ID exports.
-ENTREZ_ID_HEADER = re.compile(r"\b(entrez|ncbi\s*gene\s*id|gene\s*id|geneid)\b", re.I)
-HGNC_ID_HEADER = re.compile(r"\bhgnc\b", re.I)
+
+def load_mappings(path=DEFAULT_MAPPINGS_PATH):
+    """Load column_mappings.json and compile its regex fields. Returns a dict
+    of ready-to-use structures, keyed the same as the module-level constants
+    that used to be hardcoded here (PII_PATTERNS, GENE_PATTERNS, etc.)."""
+    with open(path) as f:
+        raw = json.load(f)
+
+    def rx(pattern):
+        return re.compile(pattern, re.I)
+
+    hp = raw["header_patterns"]
+    date_subtype = [(rx(e["pattern"]), e["model"]) for e in raw["date_subtype"]]
+    zyg_values = {geno_id: (entry["label"], set(entry["triggers"]))
+                  for geno_id, entry in raw["zygosity_values"].items()
+                  if not geno_id.startswith("_")}
+    zygosity_lookup = {_normalize_label(trigger): geno_id
+                        for geno_id, (_, triggers) in zyg_values.items()
+                        for trigger in triggers}
+    return {
+        "pii_patterns": rx(hp["pii"]["pattern"]),
+        "key_patterns": rx(hp["key"]["pattern"]),
+        "gene_patterns": rx(hp["gene"]["pattern"]),
+        "entrez_id_header": rx(hp["entrez_id_header"]["pattern"]),
+        "hgnc_id_header": rx(hp["hgnc_id_header"]["pattern"]),
+        "zygosity_header_patterns": rx(hp["zygosity"]["pattern"]),
+        "variant_header_patterns": rx(hp["variant"]["pattern"]),
+        "date_subtype": date_subtype,
+        "boolean_tokens": set(raw["boolean_tokens"]),
+        "sex_tokens": set(raw["sex_tokens"]),
+        "numeric_sentinels": set(raw["numeric_sentinels"]),
+        "zygosity_values": zyg_values,
+        "zygosity_lookup": zygosity_lookup,
+        "gene_stub_lexicon": {k: v for k, v in raw["gene_stub_lexicon"].items()
+                               if not k.startswith("_")},
+        "transcript_stub_lexicon": {k: v for k, v in raw["transcript_stub_lexicon"].items()
+                                     if not k.startswith("_")},
+        "rsid_stub_lexicon": {k: v for k, v in raw["rsid_stub_lexicon"].items()
+                               if not k.startswith("_")},
+        "lane_to_vartype": {k: v for k, v in raw["lane_to_vartype"].items()
+                             if not k.startswith("_")},
+    }
+
+
+def _normalize_label(s):
+    """Lowercase, strip punctuation, collapse whitespace — for exact-match
+    comparison only (not for scoring)."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# MAPPINGS is loaded once at import time; the module-level names below are
+# aliases kept so the rest of this file reads the same as when these tables
+# were hardcoded here. To change what maps to what, edit column_mappings.json
+# — not these aliases, and not the functions that consume them.
+MAPPINGS = load_mappings()
+PII_PATTERNS = MAPPINGS["pii_patterns"]
+KEY_PATTERNS = MAPPINGS["key_patterns"]
+GENE_PATTERNS = MAPPINGS["gene_patterns"]
+ENTREZ_ID_HEADER = MAPPINGS["entrez_id_header"]
+HGNC_ID_HEADER = MAPPINGS["hgnc_id_header"]
+ZYGOSITY_HEADER_PATTERNS = MAPPINGS["zygosity_header_patterns"]
+VARIANT_HEADER_PATTERNS = MAPPINGS["variant_header_patterns"]
+DATE_SUBTYPE = MAPPINGS["date_subtype"]
+BOOLEAN_TOKENS = MAPPINGS["boolean_tokens"]
+SEX_TOKENS = MAPPINGS["sex_tokens"]
+NUMERIC_SENTINELS = MAPPINGS["numeric_sentinels"]
+ZYGOSITY_VALUE_MAP = MAPPINGS["zygosity_values"]
+_ZYGOSITY_LOOKUP = MAPPINGS["zygosity_lookup"]
+_LANE_TO_VARTYPE = MAPPINGS["lane_to_vartype"]
+GENO_BASE = "http://purl.obolibrary.org/obo/"  # fixed ontology namespace, not a mapping table entry
+
+# ---- lexical signals (parsing mechanics, not domain vocabulary) --------------
 NUMERIC_ID_RE = re.compile(r"^\d+$")
 HGNC_CURIE_PREFIX_RE = re.compile(r"^hgnc[:_]", re.I)
-DATE_SUBTYPE = [  # (regex on header, CARE-SM model)
-    (re.compile(r"death|deceased|died", re.I), "Deathdate"),
-    (re.compile(r"birth|dob|d\.o\.b", re.I), "Birthdate"),
-    (re.compile(r"onset", re.I), "Symptoms_onset"),
-    (re.compile(r"first\s*visit|enrol|baseline", re.I), "First_visit"),
-    (re.compile(r"diagnos", re.I), "Diagnosis"),
-]
-BOOLEAN_TOKENS = {
-    "yes", "no", "y", "n", "true", "false", "positive", "negative",
-    "present", "absent", "unknown", "not applicable", "n/a", "na",
-    "carrier", "confirmed", "not confirmed",
-}
-SEX_TOKENS = {"male", "female", "m", "f", "intersex", "other", "unknown"}
 CURIE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*:[A-Za-z0-9_]+$")
-NUMERIC_SENTINELS = {"unable", "not done", "nd", "n/a", "na", "unknown", "missing"}
 DATE_FORMATS = ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%Y"]
+
+# HGVS/dbSNP notation shape — these are external-standard formats, not
+# partner-specific vocabulary, so (like CURIE_RE/NUMERIC_ID_RE above) they
+# stay in code rather than column_mappings.json.
+#
+# VARIANT_VALUE_RE: a c./g./n./m./p. HGVS prefix immediately followed by a
+# position/residue (optionally preceded by "accession(gene):" or "accession:"
+# context), OR a bare dbSNP rsID. e.g. "c.1521_1523del", "g.32317682G>A",
+# "p.Phe508del", "NM_000341.3(SLC3A1):c.-82T>G", "rs1042522".
+VARIANT_VALUE_RE = re.compile(r"(^|:)[cgpnm]\.[-*\w(]|^rs\d+$", re.I)
+VARIANT_HIT_THRESHOLD = 0.8  # HGVS syntax is rigid -- a real variant column
+                              # should be almost entirely well-formed; a low
+                              # hit-fraction is itself suspicious, not just
+                              # "partially mappable" (contrast HIT_FRACTION).
+
+# gene-lookup-from-variant: two SEPARATE identifier spaces/APIs, never
+# combined into one query (same collision-avoidance principle as
+# resolve_gene_column's HGNC-vs-entrezgene split) -- rsIDs resolve via
+# myvariant.info (dbSNP), transcript accessions via mygene.info's own
+# scope=refseq. NC_/NG_/NW_/NT_ (chromosome/genomic-level) accessions are
+# deliberately NOT matched here -- confirmed live (2026-09-23) that
+# mygene.info's refseq scope returns 0 hits for a chromosome-level accession
+# like NC_000023.9; only transcript-level (NM_/NR_/XM_/XR_) accessions are
+# gene-specific enough to resolve this way.
+TRANSCRIPT_ACCESSION_RE = re.compile(r"\b([NX][MR]_\d+(?:\.\d+)?)\b")
+RSID_RE = re.compile(r"\b(rs\d+)\b", re.I)
 
 
 # ============================================================ searchers ======
@@ -273,14 +350,9 @@ class StubGeneResolver:
     panel genes (captured live from mygene.info, 2026-09-23). NOT a
     substitute for the live resolver; every hit is tagged `_stub`."""
 
-    _LEX = {  # symbol -> HGNC numeric id (captured live, see above)
-        "ANO5": "27337", "CACNA1S": "1397", "COL6A1": "2211", "COL6A2": "2212",
-        "COL6A3": "2213", "DYSF": "3097", "FKRP": "17997", "FUS": "4010",
-        "GARS1": "4162", "GNE": "23657", "LMNA": "6636", "MFN2": "16877",
-        "MTM1": "7448", "PMP22": "9118", "RYR1": "10483", "SCN4A": "10591",
-        "SMN1": "11117", "SMN2": "11118", "SOD1": "11179",
-    }
+    _LEX = MAPPINGS["gene_stub_lexicon"]  # symbol -> HGNC numeric id; see column_mappings.json
     _BY_HGNC = {v: k for k, v in _LEX.items()}
+    _TRANSCRIPTS = MAPPINGS["transcript_stub_lexicon"]  # unversioned RefSeq accession -> symbol
 
     def batch_query(self, queries, scope, fields=None):
         out = {}
@@ -292,9 +364,72 @@ class StubGeneResolver:
                 out[q] = []  # stub lexicon has no Entrez IDs — deliberate: the
                               # offline path must never fabricate a same-number
                               # coincidence for the sampling tiebreak to reason about
+            elif scope == "refseq":
+                unversioned = q.split(".")[0]
+                sym = self._TRANSCRIPTS.get(unversioned)
+                hgnc = self._LEX.get(sym) if sym else None
+                out[q] = [{"query": q, "symbol": sym, "HGNC": hgnc, "_stub": True}] if sym else []
             else:
                 hgnc = self._LEX.get(q.upper())
                 out[q] = [{"query": q, "symbol": q.upper(), "HGNC": hgnc, "_stub": True}] if hgnc else []
+        return out
+
+
+# ==================================================== variant->gene resolution
+# dbSNP rsID resolution via myvariant.info — a SEPARATE API/identifier space
+# from mygene.info's refseq scope (see TRANSCRIPT_ACCESSION_RE/RSID_RE
+# comment above); never conflated into one call.
+MYVARIANT_URL = "https://myvariant.info/v1/variant"
+MYVARIANT_BATCH_MAX = 1000  # documented POST cap on myvariant.info
+
+
+class MyVariantResolver:
+    """Batched rsID -> gene resolution via myvariant.info's POST /v1/variant.
+    An rsID can return multiple hits (one per alt allele at that genomic
+    position) — batch_query returns ALL of them per query, unfiltered; the
+    caller (resolve_variant_column) is the one that decides whether multiple
+    hits agree on gene (clean resolve) or disagree (ambiguous -> review),
+    mirroring how resolve_gene_column treats >1 hit from mygene.info."""
+
+    def __init__(self, url=MYVARIANT_URL, timeout=30):
+        self.url = url
+        self.timeout = timeout
+        self._cache = {}  # rsid -> list of hit dicts (possibly empty)
+
+    def batch_query(self, rsids, fields="dbsnp.gene.symbol"):
+        rsids = sorted({r for r in rsids if r})
+        need = [r for r in rsids if r not in self._cache]
+        for i in range(0, len(need), MYVARIANT_BATCH_MAX):
+            chunk = need[i:i + MYVARIANT_BATCH_MAX]
+            body = urllib.parse.urlencode({"ids": ",".join(chunk), "fields": fields}).encode("utf-8")
+            req = urllib.request.Request(
+                self.url, data=body, method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    results = json.load(r)
+            except Exception as e:
+                results = [{"query": q, "_error": str(e)} for q in chunk]
+            by_query = {}
+            for hit in results:
+                by_query.setdefault(hit["query"], []).append(hit)
+            for q in chunk:
+                self._cache[q] = by_query.get(q, [])
+        return {r: self._cache[r] for r in rsids}
+
+
+class StubMyVariantResolver:
+    """Offline stand-in for demos/CI — a tiny hardcoded rsID lexicon
+    (captured live from myvariant.info, 2026-09-23; NOT NMD-panel-specific,
+    see column_mappings.json). NOT a substitute for the live resolver."""
+
+    _LEX = MAPPINGS["rsid_stub_lexicon"]  # rsID -> gene symbol
+
+    def batch_query(self, rsids, fields=None):
+        out = {}
+        for r in rsids:
+            sym = self._LEX.get(r)
+            out[r] = [{"query": r, "dbsnp": {"gene": {"symbol": sym}}, "_stub": True}] if sym else []
         return out
 
 
@@ -351,14 +486,6 @@ class StubSearcher:
 
 
 # ==================================================== rerank / selection =====
-def _normalize_label(s):
-    """Lowercase, strip punctuation, collapse whitespace — for exact-match
-    comparison only (not for scoring)."""
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
 def pick_exact_match(query, candidates, score_threshold):
     """Given the top-k candidates for `query`, prefer one whose label OR any
     synonym is an exact (normalized) match to the query text, over the raw
@@ -563,8 +690,203 @@ def resolve_gene_column(header, vals, gene_resolver, args):
             "hit_fraction": round(len(maps) / n, 2) if n else 0.0}
 
 
+# =================================================== zygosity resolution =====
+# Zygosity is one leg of the gene/variant/zygosity triad (see project design
+# notes, 2026-09-23): a column whose value states the allelic state of a
+# variant/gene, e.g. "Heterozygous", "Hom", "Compound het". Unlike GENE
+# resolution, there's no external identifier-resolution API for this — GENO's
+# own OBO synonyms are almost nonexistent (only GENO_0000137/"unspecified
+# zygosity" has real alt-labels: "unknown zygosity", "indeterminate zygosity",
+# "no-call zygosity"). This vocabulary is built from expected clinical/
+# registry shorthand instead, and is deliberately conservative: match is
+# EXACT-after-normalization (lowercase, strip punctuation/whitespace via
+# _normalize_label), never substring, to avoid false hits like "heterogeneous"
+# matching on "het". Values that carry real zygosity information but aren't in
+# this table (e.g. "biallelic", "monoallelic" -- clinically overloaded, can
+# mean compound-het OR "two variants found" OR other things depending on lab
+# convention) are deliberately left OUT and fall through to human review
+# rather than guessed at.
+#
+# Only plain heterozygous/compound-heterozygous are covered -- NOT "simple
+# heterozygous" (GENO_0000458): plain "het"/"heterozygous" always resolves to
+# GENO_0000135, never inferred as compound (GENO_0000402) or simple (458)
+# without an explicit qualifier in the value itself, and "simple heterozygous"
+# has no trigger at all until real data is seen using that term (see
+# HANDOFF/conversation, 2026-09-23 -- don't guess at synonyms for terms we
+# haven't observed in partner data yet).
+#
+# The header pattern, the GENO id -> label/triggers table, and the exclusions
+# above are all data, defined in column_mappings.json (see ZYGOSITY_HEADER_
+# PATTERNS / ZYGOSITY_VALUE_MAP / _ZYGOSITY_LOOKUP aliases near the top of
+# this file) -- edit that file, not this function, to add a synonym.
+def resolve_zygosity_value(v):
+    """Map one cell value to a GENO zygosity term, or flag it for human
+    review. Returns a dict: {"geno_id", "short_id", "iri", "label"} on a
+    match, or {"unmapped": v} when the value isn't in the vocabulary --
+    the caller decides what "unmapped" means for the record as a whole
+    (e.g. an empty cell should default to GENO_0000137, not fall in here)."""
+    key = _normalize_label(v)
+    geno_id = _ZYGOSITY_LOOKUP.get(key)
+    if not geno_id:
+        return {"unmapped": v}
+    label = ZYGOSITY_VALUE_MAP[geno_id][0]
+    return {"geno_id": geno_id, "short_id": f"geno:{geno_id.split('_')[1]}",
+            "iri": GENO_BASE + geno_id, "label": label}
+
+
+def resolve_zygosity_column(vals):
+    """Column-level wrapper around resolve_zygosity_value: classify every
+    distinct value, split into resolved/unresolved, in the same report shape
+    classify() expects from the other lanes."""
+    distinct = sorted(set(vals))
+    maps, unresolved = [], []
+    for v in distinct:
+        r = resolve_zygosity_value(v)
+        if "unmapped" in r:
+            unresolved.append(v)
+        else:
+            maps.append({"source": v, "kind": "value", "short_id": r["short_id"],
+                         "iri": r["iri"], "label": r["label"], "prefix": "geno", "score": None})
+    n = len(distinct)
+    conf = "high" if not unresolved else "medium"
+    return {"distinct_values": distinct[:SMALL_VOCAB_MAX],
+            "note": f"resolved {len(maps)}/{n} distinct values against the GENO zygosity vocabulary",
+            "confidence": conf, "proposed_mappings": maps,
+            "unresolved": unresolved[:10] or None,
+            "hit_fraction": round(len(maps) / n, 2) if n else 0.0}
+
+
+# ==================================================== variant resolution =====
+def is_variant_like(v):
+    return bool(VARIANT_VALUE_RE.search(v))
+
+
+def variant_gene_queries(vals):
+    """For every distinct value, extract whichever gene-identifying token is
+    present (rsID takes priority over a transcript accession when a value
+    somehow has both -- dbSNP is the more specific/authoritative source for
+    its own variant). Returns (rsid_by_value, transcript_by_value) -- dicts
+    from ORIGINAL value to the extracted token, only for values where one was
+    found. Values with neither (bare c./g./p. notation, or only a chromosome-
+    level NC_/NG_ accession) are absent from both -- there's nothing in the
+    value itself to resolve a gene from.
+
+    Transcript accessions are captured WITHOUT their version suffix (e.g.
+    "NM_000341.3" -> "NM_000341"): confirmed live (2026-09-23) that
+    mygene.info's POST batch endpoint (which GeneResolver uses) is
+    unreliable with the version suffix on at least one real record --
+    NM_000341.3 returned notfound via POST on 5/5 repeated calls despite
+    resolving fine via a GET single-query AND via POST once unversioned,
+    while a different accession (NM_000546.6) resolved fine versioned either
+    way. Stripping the version sidesteps the inconsistency entirely and
+    cannot cause a wrong resolution -- a RefSeq version only tracks sequence
+    revisions of the SAME transcript/gene, never a different one."""
+    rsid_by_value, transcript_by_value = {}, {}
+    for v in vals:
+        m = RSID_RE.search(v)
+        if m:
+            rsid_by_value[v] = m.group(1).lower()
+            continue
+        m = TRANSCRIPT_ACCESSION_RE.search(v)
+        if m:
+            transcript_by_value[v] = m.group(1).split(".")[0]
+    return rsid_by_value, transcript_by_value
+
+
+def resolve_variant_column(header, vals, gene_resolver, myvariant_resolver, args):
+    """Resolve the GENE behind a VARIANT-lane column's distinct values, when
+    no separate Gene column exists to supply it (the "variant alone" row of
+    the gene/variant/zygosity truth table). Two SEPARATE identifier spaces,
+    never combined into one call (same collision-avoidance principle as
+    resolve_gene_column's HGNC-vs-entrezgene split):
+
+      1. dbSNP rsID -> myvariant.info. A single rsID can return multiple hits
+         (one per alt allele at that genomic position) -- treated as a clean
+         resolve only if EVERY hit for that rsID agrees on gene symbol;
+         disagreement is flagged ambiguous, exactly like resolve_gene_column
+         treats >1 mygene.info hit.
+      2. RefSeq transcript accession (NM_/NR_/XM_/XR_ only -- confirmed live
+         2026-09-23 that chromosome-level NC_/NG_ accessions return 0 hits)
+         -> mygene.info scope=refseq, reusing the same GeneResolver as the
+         Gene lane.
+
+    A value with neither token present (bare HGVS notation, no accession) has
+    nothing to resolve a gene from and is reported unresolved.
+    """
+    distinct = sorted(set(vals))
+    rsid_by_value, transcript_by_value = variant_gene_queries(distinct)
+
+    rsid_hits = myvariant_resolver.batch_query(set(rsid_by_value.values())) if rsid_by_value else {}
+    transcript_hits = (gene_resolver.batch_query(set(transcript_by_value.values()), "refseq",
+                                                  fields="symbol,name,HGNC")
+                        if transcript_by_value else {})
+
+    # second hop: every rsID that cleanly resolved to exactly one gene symbol
+    # needs that symbol turned into an HGNC id -- batched in ONE call across
+    # the whole column, not one round trip per value.
+    rsid_symbol = {}  # value -> resolved symbol (only where unambiguous)
+    for v, rsid in rsid_by_value.items():
+        symbols = {h.get("dbsnp", {}).get("gene", {}).get("symbol")
+                   for h in rsid_hits.get(rsid, []) if h.get("dbsnp", {}).get("gene", {}).get("symbol")}
+        if len(symbols) == 1:
+            rsid_symbol[v] = next(iter(symbols))
+    symbol_hits = (gene_resolver.batch_query(set(rsid_symbol.values()),
+                                              "symbol,alias,retired,ensembl.gene", fields="symbol,HGNC")
+                    if rsid_symbol else {})
+
+    maps, unresolved, ambiguous, no_identifier = [], [], [], []
+    for v in distinct:
+        if v in rsid_by_value:
+            hits = rsid_hits.get(rsid_by_value[v], [])
+            n_symbols = len({h.get("dbsnp", {}).get("gene", {}).get("symbol")
+                              for h in hits if h.get("dbsnp", {}).get("gene", {}).get("symbol")})
+            if n_symbols == 0:
+                unresolved.append(v)
+            elif n_symbols > 1:
+                ambiguous.append(v)
+            else:
+                sym = rsid_symbol[v]
+                hgnc = symbol_hits.get(sym, [])
+                hgnc_id = hgnc[0].get("HGNC") if len(hgnc) == 1 else None
+                if not hgnc_id:
+                    unresolved.append(v)
+                else:
+                    maps.append({"source": v, "kind": "value", "short_id": f"hgnc:{hgnc_id}",
+                                 "iri": f"http://identifiers.org/hgnc/{hgnc_id}",
+                                 "label": sym, "prefix": "hgnc", "score": None,
+                                 "via": f"rsID {rsid_by_value[v]}"})
+        elif v in transcript_by_value:
+            h = transcript_hits.get(transcript_by_value[v], [])
+            if not h:
+                unresolved.append(v)
+            elif len(h) > 1:
+                ambiguous.append(v)
+            else:
+                hgnc_id = h[0].get("HGNC")
+                if not hgnc_id:
+                    unresolved.append(v)
+                else:
+                    maps.append({"source": v, "kind": "value", "short_id": f"hgnc:{hgnc_id}",
+                                 "iri": f"http://identifiers.org/hgnc/{hgnc_id}",
+                                 "label": h[0].get("symbol"), "prefix": "hgnc", "score": None,
+                                 "via": f"transcript {transcript_by_value[v]}"})
+        else:
+            no_identifier.append(v)
+
+    n = len(distinct)
+    conf = "high" if not (unresolved or ambiguous or no_identifier) else "medium"
+    return {"distinct_values": distinct[:SMALL_VOCAB_MAX],
+            "note": (f"gene-from-variant: resolved {len(maps)}/{n} distinct values "
+                     f"({len(rsid_by_value)} via rsID/myvariant.info, "
+                     f"{len(transcript_by_value)} via transcript/mygene.info refseq scope)"),
+            "confidence": conf, "proposed_mappings": maps,
+            "unresolved": unresolved[:10] or None, "ambiguous": ambiguous[:10] or None,
+            "no_identifier": no_identifier[:10] or None,
+            "hit_fraction": round(len(maps) / n, 2) if n else 0.0}
+
+
 # ============================================================ classify =======
-def classify(header, values, searcher, args, idx=0, gene_resolver=None):
+def classify(header, values, searcher, args, idx=0, gene_resolver=None, myvariant_resolver=None):
     vals = nonnull(values)
     n_distinct = len(set(vals))
     ev = {"column": header, "n_nonnull": len(vals), "n_distinct": n_distinct,
@@ -617,6 +939,48 @@ def classify(header, values, searcher, args, idx=0, gene_resolver=None):
                    proposed_mappings=res["proposed_mappings"],
                    unresolved=res.get("unresolved"), ambiguous=res.get("ambiguous"),
                    hit_fraction=res.get("hit_fraction"))
+
+    # 3.6 variant identifiers (value-shape definitive, header confirmatory) --
+    # Unlike GENE, where the header is the reliable signal, HGVS/rsID notation
+    # is a rigid external standard: the VALUES are the definitive test here,
+    # and partner header naming for "variant"/"allele" columns is expected to
+    # be inconsistent, so it's only confirmatory. Disagreement between the two
+    # signals is never silently resolved either way -- it goes to human
+    # review rather than guessing (decided 2026-09-23).
+    variant_hit_frac = frac(is_variant_like, vals)
+    header_says_variant = bool(VARIANT_HEADER_PATTERNS.search(header))
+    value_says_variant = variant_hit_frac >= VARIANT_HIT_THRESHOLD
+    if value_says_variant or header_says_variant:
+        if not value_says_variant:  # header says variant, values don't look like it -> disagreement
+            return out("VARIANT", "Genetic", "low",
+                       f"header suggests a variant column but only {variant_hit_frac:.0%} of "
+                       "values look like HGVS/rsID notation -- header and value-shape signals "
+                       "disagree, needs human review rather than an auto-guess",
+                       hit_fraction=round(variant_hit_frac, 2))
+        conf = "high" if header_says_variant else "medium"  # values alone still get a look if header didn't confirm
+        res = resolve_variant_column(header, vals, gene_resolver or StubGeneResolver(),
+                                      myvariant_resolver or StubMyVariantResolver(), args)
+        if conf == "high" and (res.get("unresolved") or res.get("ambiguous") or res.get("no_identifier")):
+            conf = "medium"
+        agree_note = ("value shape + header agree" if header_says_variant
+                       else "by value shape, header did not confirm")
+        return out("VARIANT", "Genetic", conf,
+                   f"variant column ({agree_note}) -> " + res["note"],
+                   distinct_values=res["distinct_values"],
+                   proposed_mappings=res["proposed_mappings"],
+                   unresolved=res.get("unresolved"), ambiguous=res.get("ambiguous"),
+                   no_identifier=res.get("no_identifier"), hit_fraction=res.get("hit_fraction"),
+                   variant_value_hit_fraction=round(variant_hit_frac, 2))
+
+    # 3.7 zygosity (header keyword; small closed vocabulary) -----------------
+    if ZYGOSITY_HEADER_PATTERNS.search(header):
+        res = resolve_zygosity_column(vals)
+        return out("ZYGOSITY", "Genetic", res["confidence"],
+                   "zygosity/allelic-state column (by header keyword) -> resolved against "
+                   "GENO vocabulary. " + res["note"],
+                   distinct_values=res["distinct_values"],
+                   proposed_mappings=res["proposed_mappings"],
+                   unresolved=res.get("unresolved"), hit_fraction=res.get("hit_fraction"))
 
     # 4. dates ---------------------------------------------------------------
     if frac(is_date, vals) >= 0.7:
@@ -805,11 +1169,13 @@ def collect_literal_queries(headers, body, args):
     depend on actual search scores — only the lane assignment is reusable."""
     stub = StubSearcher()
     gene_stub = StubGeneResolver()
+    myvariant_stub = StubMyVariantResolver()
     dry_results = []
     queries = set()
     for i, h in enumerate(headers):
         vals = nonnull(col_values(body, i))
-        r = classify(h, col_values(body, i), stub, args, idx=i, gene_resolver=gene_stub)
+        r = classify(h, col_values(body, i), stub, args, idx=i, gene_resolver=gene_stub,
+                     myvariant_resolver=myvariant_stub)
         dry_results.append(r)
         queries |= literal_queries_for_column(h, vals, r["lane"], args)
     return dry_results, queries
@@ -837,8 +1203,8 @@ def print_report(path, delim, headers, results, args):
     print(f"delimiter={delim!r}   columns={len(headers)}   "
           f"searcher={'OFFLINE-STUB' if args.offline else args.search_url}")
     print(f"thresholds: score>={args.score}  hit_fraction>={args.hit_fraction}\n{'='*78}")
-    lane_order = ["SEARCH", "CURIE", "GENE", "DICTIONARY", "NUMERIC", "BOOLEAN", "DATE",
-                  "KEY", "PII", "DROP"]
+    lane_order = ["SEARCH", "CURIE", "GENE", "VARIANT", "ZYGOSITY", "DICTIONARY", "NUMERIC",
+                  "BOOLEAN", "DATE", "KEY", "PII", "DROP"]
     for r in sorted(results, key=lambda x: (lane_order.index(x["lane"]), x["column"])):
         flag = "  ⚠ REVIEW" if r["review"] else ""
         model = r["care_sm_model"] or "—"
@@ -866,6 +1232,10 @@ def print_report(path, delim, headers, results, args):
             bits.append(f"unresolved={r['unresolved']}")
         if r.get("ambiguous"):
             bits.append(f"ambiguous={r['ambiguous']}")
+        if r.get("no_identifier"):
+            bits.append(f"no_identifier={r['no_identifier']}")
+        if r.get("variant_value_hit_fraction") is not None:
+            bits.append(f"variant_value_hit_fraction={r['variant_value_hit_fraction']}")
         if bits:
             print("    " + "  ".join(bits))
     # summary
@@ -876,14 +1246,6 @@ def print_report(path, delim, headers, results, args):
             print(f"  {lane:<11} {lanes[lane]}")
     review = [r["column"] for r in results if r["review"]]
     print(f"  needs human review: {len(review)} -> {review}")
-
-
-# variable_type is the vocabulary a generative model (DBM/VAE) needs; it falls
-# out of the same lane classification the CARE-SM mapping uses (dual-use).
-_LANE_TO_VARTYPE = {"BOOLEAN": "binary", "DICTIONARY": "categorical",
-                    "CURIE": "categorical", "GENE": "categorical", "NUMERIC": "continuous",
-                    "DATE": "date", "KEY": "identifier", "SEARCH": "freetext",
-                    "PII": "ignore", "DROP": "ignore"}
 
 
 def data_dictionary(headers, body, results):
@@ -928,6 +1290,7 @@ def main():
 
     searcher = StubSearcher() if args.offline else HttpSearcher(args.search_url)
     gene_resolver = StubGeneResolver() if args.offline else GeneResolver()
+    myvariant_resolver = StubMyVariantResolver() if args.offline else MyVariantResolver()
     headers, body, delim = load_table(args.file)
     if not headers:
         sys.exit(f"No data found in {args.file}")
@@ -939,7 +1302,8 @@ def main():
               f"-> {len(queries)} unique live queries needed", file=sys.stderr)
         searcher.prewarm(queries, batch_size=args.batch_size)
 
-    results = [classify(h, col_values(body, i), searcher, args, idx=i, gene_resolver=gene_resolver)
+    results = [classify(h, col_values(body, i), searcher, args, idx=i, gene_resolver=gene_resolver,
+                        myvariant_resolver=myvariant_resolver)
                for i, h in enumerate(headers)]
     if isinstance(searcher, HttpSearcher):
         print(f"Total profiling time: {time.time() - t0:.1f}s", file=sys.stderr)

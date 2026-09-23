@@ -69,7 +69,14 @@ flowchart TB
   Q3 -->|yes| KEY["KEY to pid"]
   Q3 -->|no| Q4{"Values already<br/>ontology CURIEs?"}
   Q4 -->|yes| CUR["CURIE: expand to IRI<br/>no search needed"]
-  Q4 -->|no| Q5{"Values parse<br/>as dates?"}
+  Q4 -->|no| Q4a{"Header names<br/>a gene?"}
+  Q4a -->|yes| GENE["GENE: identifier lookup<br/>(mygene.info), not search"]
+  Q4a -->|no| Q4b{"Values parse as<br/>HGVS / rsID?"}
+  Q4b -->|yes, header agrees or silent| VAR["VARIANT: gene derived from<br/>accession/rsID (mygene.info /<br/>myvariant.info)"]
+  Q4b -->|header says variant,<br/>values disagree| REVIEW["REVIEW: signals conflict,<br/>never auto-guessed"]
+  Q4b -->|no| Q4c{"Header names<br/>zygosity?"}
+  Q4c -->|yes| ZYG["ZYGOSITY: lookup against<br/>the GENO vocabulary"]
+  Q4c -->|no| Q5{"Values parse<br/>as dates?"}
   Q5 -->|yes| DATE["DATE: type it by<br/>header keyword"]
   Q5 -->|no| Q6{"Yes / No values?"}
   Q6 -->|yes| BOOL["BOOLEAN: the header<br/>is the concept"]
@@ -80,8 +87,10 @@ flowchart TB
   Q8 -->|no| SRCH["SEARCH: semantic match,<br/>then apply guards"]
 ```
 
-Nine outcomes, first match wins. Only the final branch reaches the semantic search —
-most columns are settled deterministically, which is both faster and far safer.
+Twelve outcomes, first match wins. Only the final branch reaches the semantic search —
+most columns are settled deterministically, which is both faster and far safer. GENE,
+VARIANT and ZYGOSITY are the identifier-lookup route referred to in §7 as "a missing
+fourth route" — added 2026-09-23, see the Changelog.
 
 ### Three ways a column can carry meaning
 
@@ -93,9 +102,12 @@ things. Detecting which is what determines the transform:
 | Cell-as-concept | no | **yes** | `pheno = "scoliosis"` | the value is the term |
 | Header-as-measurement | **yes** | no (numeric) | `10MWT = 8.4` | the value is a quantity |
 | Header-as-concept | **yes** | boolean | `cardiomyopathy = Yes` | the value is presence |
+| Cell-as-identifier | no (GENE) / confirmatory only (VARIANT) | **yes** | `Gene = "SCN4A"` | the value is a code needing external lookup, not search |
 
 The third pattern is common in real registries and was not anticipated in the original
-design — it emerged from the partner's data.
+design — it emerged from the partner's data. The fourth (§7's "missing fourth route",
+closed 2026-09-23) needed an identifier-resolution API instead of semantic search — see
+`resolve_gene_column`/`resolve_variant_column` in `profile_columns.py`.
 
 ---
 
@@ -214,7 +226,7 @@ Three consequences, each a silent error before:
 
 ### Models delivered
 
-Seven CARE-SM models generate end-to-end from both datasets. Row counts are
+Eight CARE-SM models generate end-to-end from both datasets. Row counts are
 *adversarial / partner*.
 
 | Model | Rows | Mapping route | Notable decision |
@@ -226,6 +238,7 @@ Seven CARE-SM models generate end-to-end from both datasets. Row counts are
 | Deathdate | 3 / 5 | deterministic | only patients with a death date |
 | Symptoms_onset | 29 / 57 | deterministic | onset date ≠ record date |
 | Status | — / 60 | curated lookup | alive / dead from a Yes-No column |
+| Genetic | 0 / 35 | identifier lookup (mygene.info / myvariant.info) | `target` (gene) is Mandatory in CARE-SM v2 — rows with no resolvable gene are skipped, never emitted blank; adversarial dataset has no gene column |
 
 ### Mapping quality, independently spot-checked
 
@@ -273,13 +286,19 @@ dropping them. Impact: Phenotype rows went from 40→68 (synthetic) and **18→1
 through the actual v2 Toolkit: of 120 partner Phenotype rows, 18 `true` all carry an
 Attribute and 102 `false` carry none.
 
-**A missing fourth route.** High-cardinality controlled vocabularies — gene symbols,
-units, drug codes — are neither free text nor small enumerations. They need an
-identifier-lookup route that doesn't exist yet. The same machinery would close the
-Laboratory and Medication gaps.
+**A missing fourth route — RESOLVED for genes (2026-09-23).** High-cardinality
+controlled vocabularies — gene symbols, units, drug codes — are neither free text nor
+small enumerations. Gene symbols needed (and now have) an identifier-lookup route
+instead of semantic search: `mygene.info` for symbols/transcript accessions,
+`myvariant.info` for dbSNP rsIDs, both resolved via `resolve_gene_column`/
+`resolve_variant_column` in `profile_columns.py`, feeding a new `build_genetic()` in
+`build_care_template.py`. Zygosity got its own small closed-vocabulary lookup (GENO
+ontology) rather than search, header-first like GENE. Units and drug codes remain open —
+the same lookup-route *shape* would apply, but no external resolver has been identified
+for those yet, so Laboratory and Medication are still gapped.
 
-**Next:** Examination (functional tests such as the 10-metre walk), then the harder
-models once the lookup route exists.
+**Next:** Examination (functional tests such as the 10-metre walk), then Laboratory/
+Medication once a unit/drug identifier-lookup source is identified.
 
 ---
 
@@ -288,8 +307,12 @@ models once the lookup route exists.
 | File | Role |
 |---|---|
 | `profile_columns.py` | Stage 2–3. Read-only column triage and mapping proposals. |
+| `column_mappings.json` | Header-trigger patterns and value vocabularies (gene, variant, zygosity, boolean, sex, date-subtype, ...) consumed by `profile_columns.py` — edit this, not the code, to change what maps to what. |
 | `build_curation_workbook.py` | Stage 4. Zero-dependency `.xlsx` writer with the verdict drop-down. |
 | `build_care_template.py` | Stage 5. M/O/U-driven emission of CARE-SM per-type CSVs. |
+| `care_template_mappings.json` | CURIE prefixes, sex/status value vocab, affirmative/negative tokens consumed by `build_care_template.py`. |
+| `test_build_care_template.py` | Regression tests for `build_care_template.py` (currently: the offline/live resolver bug — see Changelog). |
 | `SYNTHETIC-TEST-DATA-COOKBOOK.md` | Method for building adversarial test data. |
 
-All stdlib-only Python 3 — no installs — talking to the ontology search over HTTP.
+All stdlib-only Python 3 — no installs — talking to the ontology search, mygene.info and
+myvariant.info over HTTP.

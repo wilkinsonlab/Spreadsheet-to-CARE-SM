@@ -192,8 +192,9 @@ automatically.
   walkthrough of the same decision-making, if a slide-and-narrative format is
   more useful than a technical document.
 - **[`CHANGELOG.md`](CHANGELOG.md)** lists what changed and when.
-- **[CARE-SM](https://github.com/CARE-SM/CARE-Semantic-Model)** is the data
-  model this tool targets, maintained separately.
+- **[CARE-SM](https://github.com/wilkinsonlab/CARE-Semantic-Model-Version-2)**
+  is the data model this tool targets (v2, specifically), maintained
+  separately.
 
 ## For developers
 

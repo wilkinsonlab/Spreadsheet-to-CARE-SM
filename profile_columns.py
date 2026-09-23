@@ -56,6 +56,21 @@ PII_PATTERNS = re.compile(
     r"\b(?:(?:first|last|middle|maiden|sur)\s*name|full\s*name|address|postcode|"
     r"zip|phone|email|nhs\s*number|ssn|initials)\b", re.I)
 KEY_PATTERNS = re.compile(r"\b(patient\s*id|pid|record\s*id|subject\s*id|^id$)\b", re.I)
+# NB: \bgene\b deliberately does NOT match "Genetic confirmation" — the \b
+# after "gene" requires a non-word char next, but "genetic" continues with
+# "t". That column is a Yes/No flag and is caught by the BOOLEAN step instead.
+# "locus"/"loci" and "hgnc" cover common clinical-registry synonyms (Gene
+# Symbol, Gene Name, Causative/Affected Gene, HGNC ID, Locus) without a bare
+# "symbol" pattern, which would false-positive on non-gene symbol columns.
+GENE_PATTERNS = re.compile(r"\b(gene|genes|hgnc|locus|loci)\b", re.I)
+
+# ID-space hints for a GENE-lane header, cheapest signal first (see
+# resolve_gene_column). "gene id"/"geneid" is an Entrez hint, not a generic
+# one: it's NCBI's own column name for their Entrez Gene ID exports.
+ENTREZ_ID_HEADER = re.compile(r"\b(entrez|ncbi\s*gene\s*id|gene\s*id|geneid)\b", re.I)
+HGNC_ID_HEADER = re.compile(r"\bhgnc\b", re.I)
+NUMERIC_ID_RE = re.compile(r"^\d+$")
+HGNC_CURIE_PREFIX_RE = re.compile(r"^hgnc[:_]", re.I)
 DATE_SUBTYPE = [  # (regex on header, CARE-SM model)
     (re.compile(r"death|deceased|died", re.I), "Deathdate"),
     (re.compile(r"birth|dob|d\.o\.b", re.I), "Birthdate"),
@@ -187,6 +202,100 @@ class HttpSearcher:
         if k <= 3:
             self.cache_k[q] = results
         return results
+
+
+# ==================================================== gene resolution =========
+# Gene symbols/IDs are precise codes, not free text — cosine similarity over
+# a sentence embedder is structurally the wrong tool for them regardless of
+# indexing coverage (see nmdo-search project notes: PMP22/SMN1 never
+# surfaced in top-3 even once correctly indexed, while short unrelated
+# symbols outscored the real match). mygene.info is used instead: validated
+# live to resolve bare symbols, Ensembl IDs, and HGNC IDs through the same
+# endpoint, format-agnostically, in one call.
+MYGENE_URL = "https://mygene.info/v3/query"
+MYGENE_BATCH_MAX = 5000  # documented hard cap on query terms per POST; a
+                          # request over this gets HTTP 400. Batch right up
+                          # against it rather than conservatively under it —
+                          # a wide dataset's gene column can have thousands
+                          # of distinct values and each request is a real
+                          # network round trip.
+GENE_SAMPLE_SIZE = 20      # distinct values sampled for numeric-ID-space disambiguation
+GENE_SPACE_HIT_THRESHOLD = 0.95  # a scope must clear this hit-fraction to be trusted
+GENE_SPACE_MARGIN = 0.20         # ...and beat the OTHER scope by at least this much
+
+
+class GeneResolver:
+    """Batched gene-identifier resolution via mygene.info's POST /v3/query.
+
+    species=human is hardcoded, never a per-partner setting: this pipeline is
+    human-patient data only, and an unfiltered symbol query can match mouse/
+    rat homologs (confirmed live: bare "SCN4A" without species=human returned
+    599 hits spanning 5+ species).
+    """
+
+    def __init__(self, url=MYGENE_URL, timeout=30):
+        self.url = url
+        self.timeout = timeout
+        self._cache = {}  # (scope, query) -> list of hit dicts (possibly empty)
+
+    def batch_query(self, queries, scope, fields="symbol,name,HGNC"):
+        """Resolve every distinct value in `queries` against a SINGLE scope
+        (never combine scopes like HGNC+entrezgene — see resolve_gene_column
+        docstring: a bare number can collide between ID spaces and silently
+        return a confident but WRONG gene with no structural tell). Returns
+        {query: [hit, ...]} — 0, 1, or >1 hits per query."""
+        queries = sorted({q for q in queries if q})
+        need = [q for q in queries if (scope, q) not in self._cache]
+        for i in range(0, len(need), MYGENE_BATCH_MAX):
+            chunk = need[i:i + MYGENE_BATCH_MAX]
+            body = urllib.parse.urlencode({
+                "q": ",".join(chunk), "scopes": scope, "species": "human",
+                "fields": fields,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                self.url, data=body, method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    results = json.load(r)
+            except Exception as e:
+                results = [{"query": q, "_error": str(e)} for q in chunk]
+            by_query = {}
+            for hit in results:
+                by_query.setdefault(hit["query"], []).append(hit)
+            for q in chunk:
+                self._cache[(scope, q)] = by_query.get(q, [])
+        return {q: self._cache[(scope, q)] for q in queries}
+
+
+class StubGeneResolver:
+    """Offline stand-in for demos/CI — a tiny hardcoded lexicon of real NMD-
+    panel genes (captured live from mygene.info, 2026-09-23). NOT a
+    substitute for the live resolver; every hit is tagged `_stub`."""
+
+    _LEX = {  # symbol -> HGNC numeric id (captured live, see above)
+        "ANO5": "27337", "CACNA1S": "1397", "COL6A1": "2211", "COL6A2": "2212",
+        "COL6A3": "2213", "DYSF": "3097", "FKRP": "17997", "FUS": "4010",
+        "GARS1": "4162", "GNE": "23657", "LMNA": "6636", "MFN2": "16877",
+        "MTM1": "7448", "PMP22": "9118", "RYR1": "10483", "SCN4A": "10591",
+        "SMN1": "11117", "SMN2": "11118", "SOD1": "11179",
+    }
+    _BY_HGNC = {v: k for k, v in _LEX.items()}
+
+    def batch_query(self, queries, scope, fields=None):
+        out = {}
+        for q in queries:
+            if scope == "HGNC":
+                sym = self._BY_HGNC.get(q)
+                out[q] = [{"query": q, "symbol": sym, "HGNC": q, "_stub": True}] if sym else []
+            elif scope == "entrezgene":
+                out[q] = []  # stub lexicon has no Entrez IDs — deliberate: the
+                              # offline path must never fabricate a same-number
+                              # coincidence for the sampling tiebreak to reason about
+            else:
+                hgnc = self._LEX.get(q.upper())
+                out[q] = [{"query": q, "symbol": q.upper(), "HGNC": hgnc, "_stub": True}] if hgnc else []
+        return out
 
 
 class StubSearcher:
@@ -361,8 +470,101 @@ def clean_header_for_search(header):
     return re.sub(r"\s+", " ", h).strip()
 
 
+def resolve_gene_column(header, vals, gene_resolver, args):
+    """Resolve a GENE-lane column's distinct values to NMDO's own HGNC IRI
+    namespace (http://identifiers.org/hgnc/NNNNN), via mygene.info.
+
+    ID-space detection, cheapest/most-reliable signal first:
+      1. Header keyword (HGNC / Entrez / NCBI Gene ID) — free, no network,
+         and more reliable than guessing from values (mirrors GENE_PATTERNS
+         itself: a header hint beats trying to infer from data shape).
+      2. Symbol-shaped values (contain any letter, e.g. "SCN4A") -> resolve
+         directly against scopes=symbol,alias,retired,ensembl.gene. This
+         combo is safe: empirically only BARE NUMBERS collide across ID
+         spaces (HGNC numbering vs Entrez numbering); a symbol string can't
+         accidentally also be a valid number in the other space.
+      3. Only when values are purely numeric AND the header gives no hint:
+         sample up to GENE_SAMPLE_SIZE distinct values and probe scope=HGNC
+         and scope=entrezgene SEPARATELY — never combined. (Combining them
+         was tested and rejected: querying a bare number like "10591" under
+         both scopes at once returned TWO results tagged with the identical
+         query string, one correct (HGNC 10591 = SCN4A) and one a
+         completely different, confidently single-matched gene (Entrez
+         10591 = DNPH1) — no multi-match or notfound marks the wrong one.)
+         A scope is trusted only if it clears GENE_SPACE_HIT_THRESHOLD AND
+         beats the other scope by GENE_SPACE_MARGIN. Even then, this branch
+         ALWAYS returns confidence="low" (forces human review) — a live
+         test of 19 known-HGNC numbers against the WRONG scope alone still
+         "hit" 79% of the time, each one a different, confidently single-
+         matched gene. That's too close to the 95% trust bar to auto-apply
+         without a human checking a sample.
+    """
+    distinct = sorted(set(vals))
+    stripped = [HGNC_CURIE_PREFIX_RE.sub("", v) for v in distinct]
+    is_numeric_id = all(NUMERIC_ID_RE.match(v) for v in stripped)
+
+    if not is_numeric_id:
+        scope = "symbol,alias,retired,ensembl.gene"
+        fields = "symbol,name,HGNC"
+        queries = distinct
+        id_space_note = "symbol-shaped values -> scopes=symbol,alias,retired,ensembl.gene"
+        conf = "high"
+    else:
+        queries = stripped
+        if HGNC_ID_HEADER.search(header):
+            scope, id_space_note, conf = "HGNC", "header names HGNC explicitly", "high"
+        elif ENTREZ_ID_HEADER.search(header):
+            scope, id_space_note, conf = "entrezgene", "header names Entrez/NCBI Gene ID explicitly", "high"
+        else:
+            sample = queries[:GENE_SAMPLE_SIZE]
+            hgnc_hits = gene_resolver.batch_query(sample, "HGNC", fields="symbol,HGNC")
+            entrez_hits = gene_resolver.batch_query(sample, "entrezgene", fields="symbol,entrezgene")
+            hgnc_frac = sum(1 for q in sample if hgnc_hits.get(q)) / len(sample) if sample else 0.0
+            entrez_frac = sum(1 for q in sample if entrez_hits.get(q)) / len(sample) if sample else 0.0
+            if hgnc_frac >= GENE_SPACE_HIT_THRESHOLD and hgnc_frac - entrez_frac >= GENE_SPACE_MARGIN:
+                scope = "HGNC"
+            elif entrez_frac >= GENE_SPACE_HIT_THRESHOLD and entrez_frac - hgnc_frac >= GENE_SPACE_MARGIN:
+                scope = "entrezgene"
+            else:
+                scope = None
+            id_space_note = (
+                f"no header hint; sampled {len(sample)} numeric values against HGNC "
+                f"(hit-fraction={hgnc_frac:.2f}) and entrezgene (hit-fraction={entrez_frac:.2f}) "
+                + (f"-> guessed scope={scope}" if scope else "-> UNRESOLVED, ambiguous")
+                + " — always human-review regardless of outcome (see docstring)")
+            conf = "low"
+        fields = "symbol,name,HGNC" if scope == "HGNC" else "symbol,name,entrezgene,HGNC"
+
+    if scope is None:
+        return {"distinct_values": distinct[:SMALL_VOCAB_MAX], "note": id_space_note,
+                "confidence": "low", "proposed_mappings": []}
+
+    hits = gene_resolver.batch_query(queries, scope, fields=fields)
+    maps, unresolved, ambiguous = [], [], []
+    for orig, q in zip(distinct, queries):
+        h = hits.get(q, [])
+        if not h:
+            unresolved.append(orig)
+        elif len(h) > 1:
+            ambiguous.append(orig)
+        else:
+            hgnc_id = h[0].get("HGNC")
+            if not hgnc_id:
+                unresolved.append(orig)
+                continue
+            maps.append({"source": orig, "kind": "value", "short_id": f"hgnc:{hgnc_id}",
+                         "iri": f"http://identifiers.org/hgnc/{hgnc_id}",
+                         "label": h[0].get("symbol"), "prefix": "hgnc", "score": None})
+    n = len(distinct)
+    return {"distinct_values": distinct[:SMALL_VOCAB_MAX],
+            "note": id_space_note + f"; resolved {len(maps)}/{n} distinct values via mygene.info (scope={scope})",
+            "confidence": conf, "proposed_mappings": maps,
+            "unresolved": unresolved[:10] or None, "ambiguous": ambiguous[:10] or None,
+            "hit_fraction": round(len(maps) / n, 2) if n else 0.0}
+
+
 # ============================================================ classify =======
-def classify(header, values, searcher, args, idx=0):
+def classify(header, values, searcher, args, idx=0, gene_resolver=None):
     vals = nonnull(values)
     n_distinct = len(set(vals))
     ev = {"column": header, "n_nonnull": len(vals), "n_distinct": n_distinct,
@@ -396,6 +598,25 @@ def classify(header, values, searcher, args, idx=0):
         return out("CURIE", model, "high",
                    f"pre-coded {prefix} identifiers -> expand IRI + xref-resolve to NMDO",
                    curie_prefix=prefix)
+
+    # 3.5 gene identifiers (header keyword; needs a lookup, not search) ------
+    # Short symbolic codes (SCN4A, PMP22, ...) carry too little semantic
+    # content for the embedder to discriminate reliably (see nmdo-search
+    # notes) even once they're indexed correctly. The header is a much more
+    # reliable signal than the values here, so route on it directly and skip
+    # SEARCH entirely — resolve via mygene.info instead (see resolve_gene_column).
+    if GENE_PATTERNS.search(header):
+        res = resolve_gene_column(header, vals, gene_resolver or StubGeneResolver(), args)
+        conf = res["confidence"]
+        if conf == "high" and (res.get("unresolved") or res.get("ambiguous")):
+            conf = "medium"  # some values didn't resolve cleanly -> still worth a human look
+        return out("GENE", "Genetic", conf,
+                   "gene identifier column (by header keyword) -> resolved via "
+                   "mygene.info, NOT semantic search. " + res["note"],
+                   distinct_values=res["distinct_values"],
+                   proposed_mappings=res["proposed_mappings"],
+                   unresolved=res.get("unresolved"), ambiguous=res.get("ambiguous"),
+                   hit_fraction=res.get("hit_fraction"))
 
     # 4. dates ---------------------------------------------------------------
     if frac(is_date, vals) >= 0.7:
@@ -583,11 +804,12 @@ def collect_literal_queries(headers, body, args):
     for the real classify() pass — model/confidence *within* a lane can
     depend on actual search scores — only the lane assignment is reusable."""
     stub = StubSearcher()
+    gene_stub = StubGeneResolver()
     dry_results = []
     queries = set()
     for i, h in enumerate(headers):
         vals = nonnull(col_values(body, i))
-        r = classify(h, col_values(body, i), stub, args, idx=i)
+        r = classify(h, col_values(body, i), stub, args, idx=i, gene_resolver=gene_stub)
         dry_results.append(r)
         queries |= literal_queries_for_column(h, vals, r["lane"], args)
     return dry_results, queries
@@ -615,7 +837,7 @@ def print_report(path, delim, headers, results, args):
     print(f"delimiter={delim!r}   columns={len(headers)}   "
           f"searcher={'OFFLINE-STUB' if args.offline else args.search_url}")
     print(f"thresholds: score>={args.score}  hit_fraction>={args.hit_fraction}\n{'='*78}")
-    lane_order = ["SEARCH", "CURIE", "DICTIONARY", "NUMERIC", "BOOLEAN", "DATE",
+    lane_order = ["SEARCH", "CURIE", "GENE", "DICTIONARY", "NUMERIC", "BOOLEAN", "DATE",
                   "KEY", "PII", "DROP"]
     for r in sorted(results, key=lambda x: (lane_order.index(x["lane"]), x["column"])):
         flag = "  ⚠ REVIEW" if r["review"] else ""
@@ -640,6 +862,10 @@ def print_report(path, delim, headers, results, args):
             bits.append(f"curie={r['curie_prefix']}")
         if r.get("sentinels"):
             bits.append(f"sentinels={r['sentinels']}")
+        if r.get("unresolved"):
+            bits.append(f"unresolved={r['unresolved']}")
+        if r.get("ambiguous"):
+            bits.append(f"ambiguous={r['ambiguous']}")
         if bits:
             print("    " + "  ".join(bits))
     # summary
@@ -655,7 +881,7 @@ def print_report(path, delim, headers, results, args):
 # variable_type is the vocabulary a generative model (DBM/VAE) needs; it falls
 # out of the same lane classification the CARE-SM mapping uses (dual-use).
 _LANE_TO_VARTYPE = {"BOOLEAN": "binary", "DICTIONARY": "categorical",
-                    "CURIE": "categorical", "NUMERIC": "continuous",
+                    "CURIE": "categorical", "GENE": "categorical", "NUMERIC": "continuous",
                     "DATE": "date", "KEY": "identifier", "SEARCH": "freetext",
                     "PII": "ignore", "DROP": "ignore"}
 
@@ -701,6 +927,7 @@ def main():
     args = ap.parse_args()
 
     searcher = StubSearcher() if args.offline else HttpSearcher(args.search_url)
+    gene_resolver = StubGeneResolver() if args.offline else GeneResolver()
     headers, body, delim = load_table(args.file)
     if not headers:
         sys.exit(f"No data found in {args.file}")
@@ -712,7 +939,8 @@ def main():
               f"-> {len(queries)} unique live queries needed", file=sys.stderr)
         searcher.prewarm(queries, batch_size=args.batch_size)
 
-    results = [classify(h, col_values(body, i), searcher, args, idx=i) for i, h in enumerate(headers)]
+    results = [classify(h, col_values(body, i), searcher, args, idx=i, gene_resolver=gene_resolver)
+               for i, h in enumerate(headers)]
     if isinstance(searcher, HttpSearcher):
         print(f"Total profiling time: {time.time() - t0:.1f}s", file=sys.stderr)
 

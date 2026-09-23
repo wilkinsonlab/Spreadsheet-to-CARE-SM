@@ -1,5 +1,7 @@
 # Spreadsheet to CARE-SM
 
+[![Tests](https://github.com/wilkinsonlab/Spreadsheet-to-CARE-SM/actions/workflows/test.yml/badge.svg)](https://github.com/wilkinsonlab/Spreadsheet-to-CARE-SM/actions/workflows/test.yml)
+
 > **Before you start: this is currently tuned for neuromuscular disease
 > registries.** Most of the "which standard code does this diagnosis/symptom
 > match?" work in this tool is done by sending a short query to a lookup

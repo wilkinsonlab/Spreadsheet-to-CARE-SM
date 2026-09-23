@@ -24,9 +24,9 @@ No third-party libraries: the .xlsx is written directly (stdlib zipfile + XML),
 so it runs anywhere the profiler does, and the resulting file opens in Excel /
 LibreOffice with working drop-downs.
 
-Usage:
-  python3 build_curation_workbook.py mockdata/dump.mock -o curation.xlsx
-  python3 build_curation_workbook.py mockdata/dump.mock -o curation.xlsx --offline
+Usage (run from the repo root):
+  python3 src/build_curation_workbook.py mockdata/dump.mock -o curation.xlsx
+  python3 src/build_curation_workbook.py mockdata/dump.mock -o curation.xlsx --offline
 """
 
 import argparse

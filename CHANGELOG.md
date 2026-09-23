@@ -3,6 +3,22 @@
 Notable changes to the spreadsheet-to-CARE-SM pipeline. Dates are when the
 work landed on this branch, not when it was authored.
 
+## 2026-09-23 — Extracted into its own repository
+
+This project used to live at `ols_lookup/spreadsheet-2-CARE/` inside the
+`SIMPATHIC2` monorepo (SIMPATHIC funded the original work, but the pipeline
+itself has no dependency on anything else in that repo). Full commit history
+for these files was preserved via `git subtree split` — `git log` here goes
+all the way back to the original 2026-07-16 commit.
+
+Reorganized for a standalone project (and to be Docker-friendly later):
+`src/` (the three CLI tools + their JSON mapping tables), `tests/`, `docs/`
+(`PIPELINE.md`, `SYNTHETIC-TEST-DATA-COOKBOOK.md`, `talk/`). Added `LICENSE`
+(MIT), a combined Python/Ruby `.gitignore`, `.dockerignore`,
+`requirements.txt` (empty — stdlib-only on purpose)/`requirements-dev.txt`
+(pytest), a GitHub Actions test workflow, and a README rewritten for a
+clinician/registry-manager audience rather than a technical one.
+
 ## 2026-09-23 — Gene/variant/zygosity: a fourth column-routing lane, and Genetic emission
 
 - **GENE lane**: gene-symbol/gene-ID columns (`GENE_PATTERNS` header keyword) are routed

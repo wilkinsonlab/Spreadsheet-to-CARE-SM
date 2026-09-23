@@ -306,13 +306,13 @@ Medication once a unit/drug identifier-lookup source is identified.
 
 | File | Role |
 |---|---|
-| `profile_columns.py` | Stage 2–3. Read-only column triage and mapping proposals. |
-| `column_mappings.json` | Header-trigger patterns and value vocabularies (gene, variant, zygosity, boolean, sex, date-subtype, ...) consumed by `profile_columns.py` — edit this, not the code, to change what maps to what. |
-| `build_curation_workbook.py` | Stage 4. Zero-dependency `.xlsx` writer with the verdict drop-down. |
-| `build_care_template.py` | Stage 5. M/O/U-driven emission of CARE-SM per-type CSVs. |
-| `care_template_mappings.json` | CURIE prefixes, sex/status value vocab, affirmative/negative tokens consumed by `build_care_template.py`. |
-| `test_build_care_template.py` | Regression tests for `build_care_template.py` (currently: the offline/live resolver bug — see Changelog). |
-| `SYNTHETIC-TEST-DATA-COOKBOOK.md` | Method for building adversarial test data. |
+| `src/profile_columns.py` | Stage 2–3. Read-only column triage and mapping proposals. |
+| `src/column_mappings.json` | Header-trigger patterns and value vocabularies (gene, variant, zygosity, boolean, sex, date-subtype, ...) consumed by `profile_columns.py` — edit this, not the code, to change what maps to what. |
+| `src/build_curation_workbook.py` | Stage 4. Zero-dependency `.xlsx` writer with the verdict drop-down. |
+| `src/build_care_template.py` | Stage 5. M/O/U-driven emission of CARE-SM per-type CSVs. |
+| `src/care_template_mappings.json` | CURIE prefixes, sex/status value vocab, affirmative/negative tokens consumed by `build_care_template.py`. |
+| `tests/test_build_care_template.py` | Regression tests for `build_care_template.py` (currently: the offline/live resolver bug — see Changelog). |
+| `docs/SYNTHETIC-TEST-DATA-COOKBOOK.md` | Method for building adversarial test data. |
 
 All stdlib-only Python 3 — no installs — talking to the ontology search, mygene.info and
 myvariant.info over HTTP.

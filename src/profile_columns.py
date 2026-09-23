@@ -22,10 +22,10 @@ Thresholds default to values calibrated against the hosted NMDO embedder, whose
 "good match" scores sit around ~0.5-0.8 (NOT the textbook ~0.9). See the
 companion SYNTHETIC-TEST-DATA-COOKBOOK.md for the rationale.
 
-Usage:
-  python3 profile_columns.py path/to/dump.mock
-  python3 profile_columns.py dump.mock --json report.json --sample 20
-  python3 profile_columns.py dump.mock --offline      # no network; stub searcher
+Usage (run from the repo root):
+  python3 src/profile_columns.py path/to/dump.mock
+  python3 src/profile_columns.py mockdata/dump.mock --json report.json --sample 20
+  python3 src/profile_columns.py mockdata/dump.mock --offline   # no network; stub searcher
 
 stdlib only — no pip installs required.
 """

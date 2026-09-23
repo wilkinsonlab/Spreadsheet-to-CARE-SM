@@ -5,7 +5,7 @@ deterministic checks first") and slide 5 ("a column, not a value, is judged")
 compress this into pictures; this document is the ground truth they're drawn
 from — every branch, every threshold, every place a search actually happens.
 
-Source of truth: [`profile_columns.py`](../profile_columns.py), function
+Source of truth: [`profile_columns.py`](../../src/profile_columns.py), function
 `classify()` (line ~212). It runs **once per column**, top to bottom, and
 returns on the **first** rule that matches — so order is itself a decision:
 cheap, unambiguous checks are tried before anything that costs a network call

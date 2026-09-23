@@ -22,9 +22,9 @@ rather than dropped.
 `event_id` stays blank: it groups same-visit observations for the quad context
 URI, and the source dumps don't carry visit grouping.
 
-Usage:
-  python3 build_care_template.py mockdata/dump.mock -o out_dir/ --model Phenotype
-  python3 build_care_template.py mockdata/dump.mock -o out_dir/ --model Sex --offline
+Usage (run from the repo root):
+  python3 src/build_care_template.py mockdata/dump.mock -o out_dir/ --model Phenotype
+  python3 src/build_care_template.py mockdata/dump.mock -o out_dir/ --model Sex --offline
 """
 
 import argparse

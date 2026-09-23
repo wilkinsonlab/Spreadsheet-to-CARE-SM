@@ -1,0 +1,9 @@
+# Runtime dependencies for src/*.py.
+#
+# There are none, on purpose: profile_columns.py / build_care_template.py /
+# build_curation_workbook.py are written against the Python 3 standard
+# library only (urllib for HTTP, csv/json/re, etc.) — no pip installs
+# required to run them. This file exists so a Dockerfile or CI config has
+# something to point `pip install -r requirements.txt` at without erroring
+# on a missing file; it's expected to stay empty unless a real runtime
+# dependency is added.
